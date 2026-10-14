@@ -19,6 +19,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.platform.LocalContext
+import com.dzaky.vclasstracker.data.remote.VClassLinks
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -75,7 +78,9 @@ fun CoursesScreen(
         mutableStateOf<String?>(null)
     }
 
-    LaunchedEffect(Unit) {
+    var failed by remember { mutableStateOf(false) }
+    var refresh by remember { mutableStateOf(0) }
+    LaunchedEffect(refresh) {
         loading = true
 
         val result = withContext(
@@ -84,6 +89,7 @@ fun CoursesScreen(
             VClassClient.getMyCourses()
         }
 
+        failed = !result.success
         courses = result.courses
         message = result.message
 
@@ -96,9 +102,7 @@ fun CoursesScreen(
             }
             .distinct()
 
-        if (semesters.isNotEmpty()) {
-            selectedSemester = semesters.first()
-        }
+        if (selectedSemester !in semesters) selectedSemester = null
 
         loading = false
     }
@@ -245,11 +249,8 @@ fun CoursesScreen(
                 }
             }
 
-            Spacer(
-                modifier = Modifier.height(
-                    28.dp
-                )
-            )
+            TextButton(onClick = { refresh++ }, enabled = !loading) { Text("Muat ulang kelas") }
+            Spacer(Modifier.height(28.dp))
 
             Text(
                 text = "Semester",
@@ -318,6 +319,7 @@ fun CoursesScreen(
                         8.dp
                     )
                 ) {
+                    SemesterButton("Semua semester", selectedSemester == null, courses.size) { selectedSemester = null }
                     semesters.forEach {
                             semester ->
 
@@ -452,7 +454,7 @@ fun CoursesScreen(
                         )
                     ) {
                         Text(
-                            text = "Belum ada mata kuliah",
+                            text = if (failed) "Kelas belum dapat dimuat" else "Belum ada mata kuliah",
                             color = TextPrimary,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.SemiBold
@@ -692,9 +694,10 @@ private fun SemesterButton(
 private fun CourseItem(
     course: VClassCourse
 ) {
+    val context = LocalContext.current
     Card(
         modifier = Modifier
-            .fillMaxWidth(),
+            .fillMaxWidth().clickable { VClassLinks.open(context, course.url) },
         shape = RoundedCornerShape(
             16.dp
         ),
@@ -775,7 +778,7 @@ private fun CourseItem(
                         )
 
                         Text(
-                            text = course.code,
+                            text = listOf(course.code, course.className).filter { it.isNotBlank() }.joinToString(" · "),
                             color = Primary,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Medium

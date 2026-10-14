@@ -1,6 +1,7 @@
 package com.dzaky.vclasstracker.data.local
 
 import android.content.Context
+import com.dzaky.vclasstracker.data.remote.VClassSessionPolicy
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -30,7 +31,7 @@ class VClassSessionStore(
         val cookieArray =
             JSONArray()
 
-        cookies.forEach { cookie ->
+        cookies.filter { VClassSessionPolicy.accepts(it) }.forEach { cookie ->
             cookieArray.put(
                 JSONObject()
                     .put(
@@ -240,14 +241,13 @@ class VClassSessionStore(
                     builder.httpOnly()
                 }
 
-                cookies.add(
-                    builder.build()
-                )
+                val cookie = builder.build()
+                if (VClassSessionPolicy.accepts(cookie)) cookies.add(cookie)
             } catch (_: Exception) {
             }
         }
 
-        if (cookies.isEmpty()) {
+        if (cookies.none { it.name == "MoodleSession" }) {
             clear()
             return null
         }

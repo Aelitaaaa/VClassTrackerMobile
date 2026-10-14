@@ -14,6 +14,13 @@ import androidx.work.WorkerParameters
 import com.dzaky.vclasstracker.data.remote.VClassClient
 import com.dzaky.vclasstracker.notification.NotificationHelper
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 class VClassSyncWorker(
     appContext: Context,
@@ -23,16 +30,17 @@ class VClassSyncWorker(
     workerParams
 ) {
 
-    override suspend fun doWork(): Result {
+    override suspend fun doWork(): Result = syncMutex.withLock { sync() }
+
+    private suspend fun sync(): Result {
         Log.i(
             TAG,
             "Kaede mulai background sync"
         )
 
         return try {
-            VClassClient.initialize(
-                applicationContext
-            )
+            withContext(Dispatchers.IO) { VClassClient.initialize(applicationContext) }
+            val version = VClassClient.currentSessionVersion()
 
             val displayName =
                 VClassClient.getRestoredDisplayName()
@@ -51,36 +59,24 @@ class VClassSyncWorker(
                 "Session ditemukan"
             )
 
-            val deadlineResult =
-                VClassClient.getDeadlines()
+            val deadlineResult = withContext(Dispatchers.IO) { VClassClient.getDeadlines() }
+            currentCoroutineContext().ensureActive()
 
             if (!deadlineResult.success) {
-                Log.w(
-                    TAG,
-                    "Gagal mengambil deadline: ${deadlineResult.message}"
-                )
-
-                if (
-                    deadlineResult.message.contains(
-                        "Session",
-                        ignoreCase = true
-                    )
-                ) {
-                    VClassClient.clearSession()
-
-                    Log.w(
-                        TAG,
-                        "Session VClass sudah tidak valid"
-                    )
-
+                if (deadlineResult.sessionExpired) {
+                    VClassClient.withNoSession {
+                        cancel(applicationContext)
+                        reset(applicationContext)
+                        NotificationHelper.clearAll(applicationContext)
+                    }
                     return Result.success()
                 }
-
-                return Result.retry()
+                if (!VClassClient.isSessionCurrent(version)) return Result.success()
+                return if (runAttemptCount < 3) Result.retry() else Result.failure()
             }
-
+            if (isStopped || !VClassClient.isSessionCurrent(version)) return Result.success()
             val deadlines =
-                deadlineResult.deadlines
+                deadlineResult.deadlines.distinctBy { it.id }
 
             Log.i(
                 TAG,
@@ -93,11 +89,7 @@ class VClassSyncWorker(
                     Context.MODE_PRIVATE
                 )
 
-            val initialized =
-                preferences.getBoolean(
-                    KEY_INITIALIZED,
-                    false
-                )
+            val initialized = preferences.getBoolean(KEY_INITIALIZED, false) && preferences.getInt("schema", 0) == 2
 
             val knownIds =
                 preferences.getStringSet(
@@ -131,37 +123,19 @@ class VClassSyncWorker(
                     ?.toMutableSet()
                     ?: mutableSetOf()
 
+            val activeIds = deadlines.map { it.id }.toSet()
+            knownIds.retainAll(activeIds)
+            remindedThreeDays.retainAll(activeIds)
+            remindedOneDay.retainAll(activeIds)
+            remindedThreeHours.retainAll(activeIds)
             if (!initialized) {
-                knownIds.addAll(
-                    deadlines.map {
-                        it.id
-                    }
-                )
-
-                preferences
-                    .edit()
-                    .putBoolean(
-                        KEY_INITIALIZED,
-                        true
-                    )
-                    .putStringSet(
-                        KEY_KNOWN_DEADLINES,
-                        knownIds
-                    )
-                    .putLong(
-                        KEY_LAST_SYNC,
-                        System.currentTimeMillis()
-                    )
-                    .apply()
-
-                Log.i(
-                    TAG,
-                    "Sync pertama selesai. ${knownIds.size} deadline disimpan sebagai data awal"
-                )
-
-                return Result.success()
+                VClassClient.withCurrentSession(version) { NotificationHelper.clearAll(applicationContext) }
+                knownIds.clear()
+                knownIds.addAll(activeIds)
+                remindedThreeDays.clear()
+                remindedOneDay.clear()
+                remindedThreeHours.clear()
             }
-
             val now =
                 System.currentTimeMillis() /
                     1000L
@@ -175,6 +149,8 @@ class VClassSyncWorker(
             for (
                 deadline in deadlines
             ) {
+                currentCoroutineContext().ensureActive()
+                if (isStopped || !VClassClient.isSessionCurrent(version)) return Result.success()
                 val deadlineId =
                     deadline.id
 
@@ -194,7 +170,8 @@ class VClassSyncWorker(
                             .showNewTaskNotification(
                                 context = applicationContext,
                                 displayName = displayName,
-                                deadline = deadline
+                                deadline = deadline,
+                                sessionVersion = version
                             )
 
                     if (notified) {
@@ -203,11 +180,6 @@ class VClassSyncWorker(
                         )
 
                         newTaskCount++
-
-                        Log.i(
-                            TAG,
-                            "Tugas baru dinotifikasi: ${deadline.title}"
-                        )
 
                         markCurrentReminderLevel(
                             deadlineId = deadlineId,
@@ -231,7 +203,8 @@ class VClassSyncWorker(
                                     .showDeadlineNotification(
                                         context = applicationContext,
                                         displayName = displayName,
-                                        deadline = deadline
+                                        deadline = deadline,
+                                        sessionVersion = version
                                     )
 
                             if (notified) {
@@ -248,11 +221,6 @@ class VClassSyncWorker(
                                 )
 
                                 reminderCount++
-
-                                Log.i(
-                                    TAG,
-                                    "Reminder 3 jam: ${deadline.title}"
-                                )
                             }
                         }
                     }
@@ -266,7 +234,8 @@ class VClassSyncWorker(
                                     .showDeadlineNotification(
                                         context = applicationContext,
                                         displayName = displayName,
-                                        deadline = deadline
+                                        deadline = deadline,
+                                        sessionVersion = version
                                     )
 
                             if (notified) {
@@ -279,11 +248,6 @@ class VClassSyncWorker(
                                 )
 
                                 reminderCount++
-
-                                Log.i(
-                                    TAG,
-                                    "Reminder 24 jam: ${deadline.title}"
-                                )
                             }
                         }
                     }
@@ -297,7 +261,8 @@ class VClassSyncWorker(
                                     .showDeadlineNotification(
                                         context = applicationContext,
                                         displayName = displayName,
-                                        deadline = deadline
+                                        deadline = deadline,
+                                        sessionVersion = version
                                     )
 
                             if (notified) {
@@ -306,40 +271,41 @@ class VClassSyncWorker(
                                 )
 
                                 reminderCount++
-
-                                Log.i(
-                                    TAG,
-                                    "Reminder 3 hari: ${deadline.title}"
-                                )
                             }
                         }
                     }
                 }
             }
 
-            preferences
-                .edit()
-                .putStringSet(
-                    KEY_KNOWN_DEADLINES,
-                    knownIds
-                )
-                .putStringSet(
-                    KEY_REMINDER_THREE_DAYS,
-                    remindedThreeDays
-                )
-                .putStringSet(
-                    KEY_REMINDER_ONE_DAY,
-                    remindedOneDay
-                )
-                .putStringSet(
-                    KEY_REMINDER_THREE_HOURS,
-                    remindedThreeHours
-                )
-                .putLong(
-                    KEY_LAST_SYNC,
-                    System.currentTimeMillis()
-                )
-                .apply()
+            if (VClassClient.withCurrentSession(version) {
+                preferences
+                    .edit()
+                    .putInt("schema", 2)
+                    .putBoolean(KEY_INITIALIZED, true)
+                    .putStringSet(
+                        KEY_KNOWN_DEADLINES,
+                        knownIds
+                    )
+                    .putStringSet(
+                        KEY_REMINDER_THREE_DAYS,
+                        remindedThreeDays
+                    )
+                    .putStringSet(
+                        KEY_REMINDER_ONE_DAY,
+                        remindedOneDay
+                    )
+                    .putStringSet(
+                        KEY_REMINDER_THREE_HOURS,
+                        remindedThreeHours
+                    )
+                    .putLong(
+                        KEY_LAST_SYNC,
+                        System.currentTimeMillis()
+                    )
+                    .apply()
+
+                true
+            } != true) return Result.success()
 
             Log.i(
                 TAG,
@@ -347,14 +313,11 @@ class VClassSyncWorker(
             )
 
             Result.success()
-        } catch (e: Exception) {
-            Log.e(
-                TAG,
-                "Background sync error",
-                e
-            )
-
-            Result.retry()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            Log.w(TAG, "Background sync belum berhasil")
+            if (runAttemptCount < 3) Result.retry() else Result.failure()
         }
     }
 
@@ -399,6 +362,8 @@ class VClassSyncWorker(
     }
 
     companion object {
+        private val syncMutex = Mutex()
+
 
         private const val TAG =
             "KaedeSync"
@@ -498,7 +463,7 @@ class VClassSyncWorker(
                 )
                 .enqueueUniqueWork(
                     TEST_WORK_NAME,
-                    ExistingWorkPolicy.REPLACE,
+                    ExistingWorkPolicy.KEEP,
                     request
                 )
 

@@ -20,6 +20,15 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.platform.LocalContext
+import com.dzaky.vclasstracker.data.remote.EnrollmentResult
+import com.dzaky.vclasstracker.data.remote.EnrollmentState
+import com.dzaky.vclasstracker.ui.login.OfficialVClassWebView
+import com.dzaky.vclasstracker.data.remote.VClassLinks
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -66,7 +75,7 @@ fun AddCourseScreen(
     onBack: () -> Unit,
     onCourseSelected: (VClassCourse) -> Unit
 ) {
-    var query by remember {
+    var query by rememberSaveable {
         mutableStateOf("")
     }
 
@@ -91,37 +100,132 @@ fun AddCourseScreen(
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
 
-    fun search() {
-        if (loading) {
-            return
-        }
+    val context = LocalContext.current
+    var submittedQuery by remember { mutableStateOf("") }
+    var nextPage by remember { mutableStateOf<Int?>(null) }
+    var selectedCourse by remember { mutableStateOf<VClassCourse?>(null) }
+    var enrollment by remember { mutableStateOf<EnrollmentResult?>(null) }
+    var enrollmentKey by remember { mutableStateOf("") }
+    var enrolling by remember { mutableStateOf(false) }
+    var inOfficialPage by remember { mutableStateOf(false) }
 
-        if (query.trim().length < 2) {
-            message = "Masukkan minimal 2 karakter."
+    fun search(append: Boolean = false) {
+        if (loading || selectedCourse != null) return
+        val searchQuery = if (append) submittedQuery else query.trim()
+        val page = if (append) nextPage ?: return else 0
+        if (searchQuery.length !in 2..200) {
+            results = emptyList()
+            nextPage = null
+            message = "Masukkan 2–200 karakter."
             searched = false
             return
         }
-
+        loading = true
+        searched = true
+        if (!append) { results = emptyList(); submittedQuery = searchQuery }
+        message = ""
+        focusManager.clearFocus()
         scope.launch {
-            loading = true
-            searched = true
-            message = ""
-            results = emptyList()
-
-            focusManager.clearFocus()
-
-            val result = withContext(
-                Dispatchers.IO
-            ) {
-                VClassClient.searchCourses(
-                    query.trim()
-                )
-            }
-
-            results = result.courses
-            message = result.message
-            loading = false
+            try {
+                val result = withContext(Dispatchers.IO) { VClassClient.searchCourses(searchQuery, page) }
+                if (result.success) results = (if (append) results + result.courses else result.courses).distinctBy { it.id }
+                nextPage = result.nextPage
+                message = result.message
+            } finally { loading = false }
         }
+    }
+
+    fun inspect(course: VClassCourse) {
+        if (enrolling) return
+        selectedCourse = course
+        enrollment = null
+        enrollmentKey = ""
+        enrolling = true
+        scope.launch {
+            try { enrollment = withContext(Dispatchers.IO) { VClassClient.inspectEnrollment(course) } }
+            finally { enrolling = false }
+        }
+    }
+
+    fun verifyMembership(cookieHeader: String = "") {
+        val course = selectedCourse ?: return
+        if (enrolling) return
+        inOfficialPage = false
+        enrolling = true
+        scope.launch {
+            try {
+                val handoff = if (cookieHeader.isNotBlank()) withContext(Dispatchers.IO) {
+                    VClassClient.completeMicrosoftLogin(cookieHeader, sameAccountOnly = true)
+                } else null
+                if (handoff != null && !handoff.success) {
+                    enrollment = EnrollmentResult(false, message = handoff.message, officialUrl = course.url)
+                    return@launch
+                }
+                val result = withContext(Dispatchers.IO) { VClassClient.getMyCourses() }
+                enrollment = if (result.success && result.courses.any { it.id == course.id }) {
+                    EnrollmentResult(true, EnrollmentState.ALREADY_ENROLLED, "Kelas terverifikasi di Kelas saya.", course.url)
+                } else EnrollmentResult(false, message = if (!result.success) result.message else "Kamu belum terdaftar dalam kelas ini. Selesaikan pendaftaran di VClass.", officialUrl = course.url)
+            } finally { enrolling = false; enrollmentKey = "" }
+        }
+    }
+
+    if (inOfficialPage) {
+        val course = selectedCourse
+        if (course != null) {
+            OfficialVClassWebView(
+                initialUrl = enrollment?.officialUrl?.ifBlank { course.url } ?: course.url,
+                authentication = false,
+                onClose = { verifyMembership() },
+                onVerifyEnrollment = { header -> verifyMembership(header) }
+            )
+            return
+        }
+    }
+
+    selectedCourse?.let { course ->
+        AlertDialog(
+            onDismissRequest = { if (!enrolling) { selectedCourse = null; enrollmentKey = ""; enrollment = null } },
+            title = { Text(course.name) },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    listOf(course.code, course.className, course.semester, course.instructor).filter { it.isNotBlank() }.forEach { Text(it) }
+                    Spacer(Modifier.height(12.dp))
+                    Text(if (enrolling) "Memeriksa VClass..." else enrollment?.message.orEmpty())
+                    if (enrollment?.state == EnrollmentState.KEY_REQUIRED && enrollment?.form != null) {
+                        OutlinedTextField(
+                            value = enrollmentKey, onValueChange = { enrollmentKey = it },
+                            label = { Text("Kunci pendaftaran kelas") }, singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(), enabled = !enrolling
+                        )
+                    }
+                    if (enrollment?.state == EnrollmentState.ALREADY_ENROLLED) {
+                        TextButton(onClick = { VClassLinks.open(context, course.url) }) { Text("Buka kelas di VClass") }
+                    }
+                }
+            },
+            confirmButton = {
+                val state = enrollment
+                when {
+                    state?.state == EnrollmentState.ALREADY_ENROLLED -> TextButton(onClick = { selectedCourse = null; onCourseSelected(course) }) { Text("Lihat kelas saya") }
+                    state?.form != null -> TextButton(
+                        enabled = !enrolling && (state.state != EnrollmentState.KEY_REQUIRED || enrollmentKey.isNotBlank()),
+                        onClick = {
+                            val key = enrollmentKey
+                            enrollmentKey = ""
+                            enrolling = true
+                            scope.launch {
+                                try { enrollment = withContext(Dispatchers.IO) { VClassClient.enrollInCourse(course, key) } }
+                                finally { enrolling = false; enrollmentKey = "" }
+                            }
+                        }
+                    ) { Text("Daftar kelas") }
+                    !enrolling -> TextButton(onClick = { enrollmentKey = ""; inOfficialPage = true }) { Text("Buka pendaftaran resmi") }
+                }
+            },
+            dismissButton = {
+                TextButton(enabled = !enrolling, onClick = { selectedCourse = null; enrollmentKey = ""; enrollment = null }) { Text("Tutup") }
+            }
+        )
     }
 
     Column(
@@ -411,7 +515,7 @@ fun AddCourseScreen(
                                 message
 
                             else ->
-                                "Cari kelas untuk melihat hasil"
+                                message.ifBlank { "Cari kelas untuk melihat hasil" }
                         },
                         color = TextSecondary,
                         fontSize = 10.sp
@@ -481,9 +585,7 @@ fun AddCourseScreen(
                         SearchCourseCard(
                             course = course,
                             onClick = {
-                                onCourseSelected(
-                                    course
-                                )
+                                inspect(course)
                             }
                         )
 
@@ -510,11 +612,10 @@ fun AddCourseScreen(
                 }
             }
 
-            Spacer(
-                modifier = Modifier.height(
-                    30.dp
-                )
-            )
+            if (nextPage != null && !loading) {
+                Button(onClick = { search(append = true) }, modifier = Modifier.fillMaxWidth()) { Text("Muat hasil berikut") }
+            }
+            Spacer(Modifier.height(30.dp))
         }
     }
 }
@@ -627,7 +728,7 @@ private fun SearchCourseCard(
                         )
 
                         Text(
-                            text = course.code,
+                            text = listOf(course.code, course.className).filter { it.isNotBlank() }.joinToString(" · "),
                             color = Primary,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Medium

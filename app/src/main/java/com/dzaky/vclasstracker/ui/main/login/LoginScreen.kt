@@ -19,23 +19,17 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,19 +39,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.dzaky.vclasstracker.data.remote.VClassClient
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 private val AppBackground = Color(0xFFF3F5F7)
 private val HeroBackground = Color(0xFFDCE8F2)
@@ -66,56 +50,20 @@ private val Primary = Color(0xFF183B56)
 private val Accent = Color(0xFFD6A34A)
 private val TextPrimary = Color(0xFF17212B)
 private val TextSecondary = Color(0xFF66727D)
-private val Border = Color(0xFFD9DEE3)
-private val FieldBackground = Color(0xFFF9FAFB)
 private val White = Color(0xFFFFFFFF)
 
 @Composable
 fun LoginScreen(
     onLoginSuccess: (String) -> Unit
 ) {
-    var username by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var passwordVisible by remember { mutableStateOf(false) }
-    var loading by remember { mutableStateOf(false) }
-    var message by remember { mutableStateOf("") }
-    var loginSuccess by remember { mutableStateOf(false) }
-
-    val scope = rememberCoroutineScope()
-    val focusManager = LocalFocusManager.current
+    var authenticating by remember { mutableStateOf(false) }
     val scrollState = rememberScrollState()
-
-    fun login() {
-        if (username.isBlank() || password.isBlank()) {
-            loginSuccess = false
-            message = "Isi username dan password terlebih dahulu."
-            return
-        }
-
-        scope.launch {
-            loading = true
-            message = ""
-            focusManager.clearFocus()
-
-            val result = withContext(Dispatchers.IO) {
-                VClassClient.login(
-                    username = username.trim(),
-                    password = password
-                )
-            }
-
-            loading = false
-            loginSuccess = result.success
-            message = result.message
-
-            if (result.success) {
-                onLoginSuccess(
-                    result.displayName.ifBlank {
-                        username
-                    }
-                )
-            }
-        }
+    if (authenticating) {
+        MicrosoftAuthScreen(
+            onCancel = { authenticating = false },
+            onLoginSuccess = { name -> authenticating = false; onLoginSuccess(name) }
+        )
+        return
     }
 
     Column(
@@ -335,7 +283,7 @@ fun LoginScreen(
                         )
 
                         Text(
-                            text = "Masuk dengan akun VClass kamu",
+                            text = "Gunakan akun Microsoft mahasiswa UG",
                             color = TextSecondary,
                             fontSize = 12.sp
                         )
@@ -371,208 +319,10 @@ fun LoginScreen(
                     )
                 )
 
-                Text(
-                    text = "Username",
-                    color = TextPrimary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                Spacer(
-                    modifier = Modifier.height(
-                        7.dp
-                    )
-                )
-
-                OutlinedTextField(
-                    value = username,
-                    onValueChange = {
-                        username = it
-                        message = ""
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(58.dp),
-                    placeholder = {
-                        Text(
-                            text = "username@student.gunadarma.ac.id",
-                            color = Color(
-                                0xFFA1A8AE
-                            ),
-                            fontSize = 13.sp
-                        )
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(
-                        11.dp
-                    ),
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Email,
-                        imeAction = ImeAction.Next
-                    ),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Primary,
-                        unfocusedBorderColor = Border,
-                        focusedContainerColor = FieldBackground,
-                        unfocusedContainerColor = FieldBackground,
-                        cursorColor = Primary
-                    ),
-                    textStyle = TextStyle(
-                        color = TextPrimary,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                )
-
-                Spacer(
-                    modifier = Modifier.height(
-                        18.dp
-                    )
-                )
-
-                Text(
-                    text = "Password",
-                    color = TextPrimary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                Spacer(
-                    modifier = Modifier.height(
-                        7.dp
-                    )
-                )
-
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = {
-                        password = it
-                        message = ""
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(58.dp),
-                    placeholder = {
-                        Text(
-                            text = "Password VClass",
-                            color = Color(
-                                0xFFA1A8AE
-                            ),
-                            fontSize = 14.sp
-                        )
-                    },
-                    trailingIcon = {
-                        TextButton(
-                            onClick = {
-                                passwordVisible =
-                                    !passwordVisible
-                            }
-                        ) {
-                            Text(
-                                text = if (
-                                    passwordVisible
-                                ) {
-                                    "Tutup"
-                                } else {
-                                    "Lihat"
-                                },
-                                color = Primary,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(
-                        11.dp
-                    ),
-                    visualTransformation =
-                        if (passwordVisible) {
-                            VisualTransformation.None
-                        } else {
-                            PasswordVisualTransformation()
-                        },
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Password,
-                        imeAction = ImeAction.Done
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onDone = {
-                            login()
-                        }
-                    ),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Primary,
-                        unfocusedBorderColor = Border,
-                        focusedContainerColor = FieldBackground,
-                        unfocusedContainerColor = FieldBackground,
-                        cursorColor = Primary
-                    ),
-                    textStyle = TextStyle(
-                        color = TextPrimary,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                )
-
-                if (message.isNotEmpty()) {
-                    Spacer(
-                        modifier = Modifier.height(
-                            14.dp
-                        )
-                    )
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(
-                                RoundedCornerShape(
-                                    9.dp
-                                )
-                            )
-                            .background(
-                                if (loginSuccess) {
-                                    Color(
-                                        0xFFEAF3EC
-                                    )
-                                } else {
-                                    Color(
-                                        0xFFF9EDED
-                                    )
-                                }
-                            )
-                            .padding(12.dp)
-                    ) {
-                        Text(
-                            text = message,
-                            color = if (
-                                loginSuccess
-                            ) {
-                                Color(
-                                    0xFF35613C
-                                )
-                            } else {
-                                Color(
-                                    0xFF8E3F3F
-                                )
-                            },
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                }
-
-                Spacer(
-                    modifier = Modifier.height(
-                        22.dp
-                    )
-                )
-
                 Button(
                     onClick = {
-                        login()
+                        authenticating = true
                     },
-                    enabled = !loading,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(54.dp),
@@ -589,11 +339,7 @@ fun LoginScreen(
                     )
                 ) {
                     Text(
-                        text = if (loading) {
-                            "Menghubungkan..."
-                        } else {
-                            "Masuk ke VClass"
-                        },
+                        text = "Masuk dengan Microsoft",
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -650,7 +396,7 @@ fun LoginScreen(
                     )
 
                     Text(
-                        text = "  Password hanya digunakan untuk autentikasi ke portal VClass dan tidak disimpan.",
+                        text = "Login dilakukan melalui halaman resmi Microsoft. VClass Tracker tidak menerima atau menyimpan password Microsoft.",
                         color = TextSecondary,
                         fontSize = 10.sp,
                         lineHeight = 15.sp,

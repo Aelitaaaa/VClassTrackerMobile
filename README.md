@@ -26,7 +26,7 @@ Aplikasi terhubung langsung ke VClass dan menyediakan ringkasan kelas, deadline,
 
 ## Fitur
 
-- Login menggunakan akun VClass
+- Login mahasiswa melalui halaman resmi Microsoft SSO / VClass
 - Dashboard ringkas
 - Daftar mata kuliah yang terdaftar
 - Filter semester
@@ -42,11 +42,15 @@ Aplikasi terhubung langsung ke VClass dan menyediakan ringkasan kelas, deadline,
 - Bottom navigation: Beranda, Tugas, Kelas, Profil
 - Kaede sebagai karakter assistant aplikasi
 
-### Tentang fitur pencarian kelas
+### Tentang fitur pencarian dan pendaftaran kelas
 
-Menu pencarian kelas digunakan untuk mencari mata kuliah di VClass.
+Menu **Tambah Kelas** mencari katalog VClass berdasarkan nama, kode, kelas, atau semester. Halaman berikutnya dimuat lewat tombol **Muat hasil berikut**, dan hasil ganda disaring berdasarkan ID kelas.
 
-Fitur tersebut **tidak melakukan enrollment otomatis** ke mata kuliah. Enrollment tetap mengikuti mekanisme yang tersedia di VClass.
+Memilih hasil membuka pemeriksaan pendaftaran, bukan langsung kembali ke daftar kelas. Aplikasi memeriksa **Kelas saya** terlebih dahulu. Untuk form pendaftaran mandiri Moodle yang dikenali, aplikasi meminta konfirmasi dan memakai action, sesskey, serta nilai form dari halaman resmi. Kunci kelas hanya dipakai untuk pengiriman tersebut dan tidak disimpan.
+
+Form yang tidak dikenali, persetujuan dosen, akses tamu, atau pendaftaran terbatas ditangani lewat halaman resmi VClass yang dibuka dengan sesi VClass aplikasi. Setelah kembali, aplikasi mengambil **Kelas saya** lagi. Pesan berhasil hanya muncul jika ID kelas ditemukan dalam daftar tersebut. Tombol **Lihat kelas saya** membuka daftar yang dimuat ulang.
+
+Pendaftaran tetap mengikuti izin dan aturan VClass. Akses ke halaman kelas atau akses tamu saja tidak dianggap sebagai enrollment.
 
 ---
 
@@ -76,11 +80,17 @@ Jika Android meminta izin instalasi dari sumber lain, aktifkan izin tersebut han
 
 ### 2. Login
 
-Buka VClass Tracker lalu login menggunakan akun VClass Gunadarma.
+Tekan **Masuk dengan Microsoft**. Aplikasi membuka:
 
-Aplikasi tidak menyimpan password VClass.
+https://v-class.gunadarma.ac.id/login/index.php?loginredirect=1
 
-Session login disimpan secara lokal dalam bentuk terenkripsi menggunakan Android Keystore.
+Pilih login mahasiswa Microsoft di halaman VClass, lalu selesaikan autentikasi dan MFA pada halaman resmi Microsoft. VClass Tracker tidak menyediakan form password Microsoft, membaca isi kolom password, menyimpan password, atau mengotomatisasi MFA/CAPTCHA.
+
+Login menggunakan WebView khusus yang ditutup dan dihancurkan setelah selesai. Tidak ada JavaScript interface atau injeksi script. Aplikasi hanya mengimpor cookie sesi VClass (`MoodleSession` dan cookie affinity `srv_id`); cookie Microsoft tidak disalin ke OkHttp maupun penyimpanan sesi. Aplikasi memeriksa halaman VClass yang terautentikasi sebelum menyatakan login berhasil.
+
+Sesi VClass disimpan lokal dalam bentuk terenkripsi AES/GCM melalui Android Keystore. Saat aplikasi dibuka kembali, sesi harus lolos verifikasi server. Gangguan jaringan menampilkan tombol coba lagi; sesi kedaluwarsa meminta login Microsoft kembali. Logout membatalkan sinkronisasi, menghapus sesi, data browser aplikasi, status notifikasi, dan tampilan akun sebelumnya.
+
+WebView dipakai karena browser/Custom Tabs tidak menyediakan cara mengekspor cookie Moodle ke OkHttp, dan callback VClass saat ini kembali ke server VClass. Aplikasi tidak mendaftarkan atau mengarang callback Microsoft sendiri. Jika kebijakan kampus mengharuskan broker, browser terkelola, atau metode yang tidak didukung WebView, login aplikasi mungkin tidak bisa diselesaikan; kebijakan tersebut tidak dilewati. Integrasi browser native memerlukan dukungan handoff resmi dari pengelola VClass.
 
 ### 3. Dashboard
 
@@ -132,7 +142,10 @@ VClass Tracker dirancang tanpa backend tambahan.
 
 Koneksi dilakukan langsung dari aplikasi ke layanan VClass Gunadarma.
 
-- Password VClass tidak disimpan oleh aplikasi
+- Password Microsoft tidak diterima atau disimpan oleh kode aplikasi
+- Cookie Microsoft tidak disalin ke klien jaringan atau sesi terenkripsi
+- Data autentikasi browser aplikasi dibersihkan setelah interaksi
+- Backup aplikasi dinonaktifkan untuk melindungi data autentikasi
 - Session disimpan secara lokal
 - Data session dilindungi menggunakan AES/GCM melalui Android Keystore
 - Signing key aplikasi tidak disertakan dalam repository
@@ -144,7 +157,7 @@ Koneksi dilakukan langsung dari aplikasi ke layanan VClass Gunadarma.
 
 ### Requirements
 
-- JDK 17 atau lebih baru untuk toolchain project
+- JDK 17 untuk toolchain project
 - Android SDK
 - Android SDK Platform 36
 - Android Build Tools
@@ -153,7 +166,7 @@ Koneksi dilakukan langsung dari aplikasi ke layanan VClass Gunadarma.
 Clone repository:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Aelitaaaa/VClassTrackerMobile.git
 cd VClassTrackerMobile
 ```
 
@@ -174,6 +187,16 @@ APK debug akan tersedia di:
 ```text
 app/build/outputs/apk/debug/app-debug.apk
 ```
+
+### Validasi
+
+```bash
+./gradlew test lintDebug lintRelease assembleDebug assembleRelease
+```
+
+GitHub Actions menjalankan kelima pemeriksaan ini dan menyimpan laporan serta APK debug/release unsigned sebagai artifact. Workflow tidak membuat GitHub Release. Tanpa signing pribadi, `assembleRelease` menghasilkan APK unsigned untuk pemeriksaan build.
+
+Test parser memakai fixture sintetis tanpa data mahasiswa. Status validasi perubahan dan pengujian perangkat dicatat di [docs/validation.md](docs/validation.md). Test fixture tidak membuktikan bahwa login/MFA atau form pendaftaran akun kampus sudah diuji langsung.
 
 ### Release Signing
 
@@ -265,7 +288,7 @@ VClass Tracker Android dibuat sebagai project independen menggunakan Kotlin dan 
 
 ## Disclaimer
 
-VClass Tracker adalah project independen dan **bukan aplikasi resmi Universitas Gunadarma**.
+VClass Tracker adalah project independen dan **bukan aplikasi resmi Universitas Gunadarma** dan tidak berafiliasi dengan Microsoft.
 
 Nama, layanan, dan sistem VClass tetap menjadi milik pihak terkait. Aplikasi ini dibuat sebagai companion tool untuk membantu pengguna mengakses dan memantau informasi VClass dengan lebih praktis.
 

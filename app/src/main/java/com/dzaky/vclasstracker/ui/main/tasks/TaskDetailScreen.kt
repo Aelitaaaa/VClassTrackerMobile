@@ -1,7 +1,5 @@
 package com.dzaky.vclasstracker.ui.tasks
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -31,6 +29,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dzaky.vclasstracker.data.remote.VClassDeadline
+import com.dzaky.vclasstracker.data.remote.VClassClient
+import com.dzaky.vclasstracker.ui.components.rememberDeadlineClock
+import com.dzaky.vclasstracker.data.remote.VClassLinks
+import com.dzaky.vclasstracker.data.remote.VClassSessionPolicy
 
 private val AppBackground = Color(0xFFF4F5F6)
 private val HeaderBackground = Color(0xFFDCE8F2)
@@ -52,25 +54,30 @@ fun TaskDetailScreen(
     deadline: VClassDeadline,
     onBack: () -> Unit
 ) {
-    val context =
-        LocalContext.current
+    val context = LocalContext.current
+    val now = rememberDeadlineClock()
+    val time = VClassClient.createDeadlineTimeInfo(deadline.deadlineTimestamp, now)
+    val displayedDeadline = deadline.copy(urgency = time.urgency, timeLeft = time.timeLeft)
 
     val statusColor =
-        when (deadline.urgency) {
+        when (displayedDeadline.urgency) {
+            "expired" -> Urgent
             "urgent" -> Urgent
             "soon" -> Soon
             else -> Safe
         }
 
     val statusBackground =
-        when (deadline.urgency) {
+        when (displayedDeadline.urgency) {
+            "expired" -> UrgentSoft
             "urgent" -> UrgentSoft
             "soon" -> SoonSoft
             else -> SafeSoft
         }
 
     val statusText =
-        when (deadline.urgency) {
+        when (displayedDeadline.urgency) {
+            "expired" -> "Terlewat"
             "urgent" -> "Mendesak"
             "soon" -> "Segera"
             else -> "Aman"
@@ -243,7 +250,7 @@ fun TaskDetailScreen(
                         ) {
                             Text(
                                 text =
-                                    deadline.type
+                                    displayedDeadline.type
                                         .uppercase(),
                                 color = Color(
                                     0xFFE2C178
@@ -262,7 +269,7 @@ fun TaskDetailScreen(
                         )
 
                         Text(
-                            text = deadline.timeLeft,
+                            text = displayedDeadline.timeLeft,
                             color = White,
                             fontSize = 10.sp,
                             fontWeight =
@@ -277,7 +284,7 @@ fun TaskDetailScreen(
                     )
 
                     Text(
-                        text = deadline.title,
+                        text = displayedDeadline.title,
                         color = White,
                         fontSize = 18.sp,
                         lineHeight = 24.sp,
@@ -296,7 +303,7 @@ fun TaskDetailScreen(
 
                     Text(
                         text =
-                            deadline.courseName
+                            displayedDeadline.courseName
                                 .ifBlank {
                                     "Mata kuliah tidak diketahui"
                                 },
@@ -332,7 +339,7 @@ fun TaskDetailScreen(
             DetailItem(
                 label = "Mata kuliah",
                 value =
-                    deadline.courseName
+                    displayedDeadline.courseName
                         .ifBlank {
                             "-"
                         },
@@ -348,7 +355,7 @@ fun TaskDetailScreen(
             DetailItem(
                 label = "Kode kelas",
                 value =
-                    deadline.courseCode
+                    displayedDeadline.courseCode
                         .ifBlank {
                             "-"
                         },
@@ -364,7 +371,7 @@ fun TaskDetailScreen(
             DetailItem(
                 label = "Jenis aktivitas",
                 value =
-                    deadline.type
+                    displayedDeadline.type
                         .ifBlank {
                             "-"
                         },
@@ -380,7 +387,7 @@ fun TaskDetailScreen(
             DetailItem(
                 label = "Deadline",
                 value =
-                    deadline.deadlineDisplay
+                    displayedDeadline.deadlineDisplay
                         .ifBlank {
                             "-"
                         },
@@ -396,7 +403,7 @@ fun TaskDetailScreen(
             DetailItem(
                 label = "Sisa waktu",
                 value =
-                    deadline.timeLeft
+                    displayedDeadline.timeLeft
                         .ifBlank {
                             "-"
                         },
@@ -440,20 +447,9 @@ fun TaskDetailScreen(
                     )
                     .clickable(
                         enabled =
-                            deadline.url
-                                .isNotBlank()
+                            VClassSessionPolicy.officialUrl(displayedDeadline.url) != null
                     ) {
-                        val intent =
-                            Intent(
-                                Intent.ACTION_VIEW,
-                                Uri.parse(
-                                    deadline.url
-                                )
-                            )
-
-                        context.startActivity(
-                            intent
-                        )
+                        VClassLinks.open(context, displayedDeadline.url)
                     }
                     .padding(
                         vertical = 14.dp
@@ -464,8 +460,7 @@ fun TaskDetailScreen(
                 Text(
                     text =
                         if (
-                            deadline.url
-                                .isNotBlank()
+                            VClassSessionPolicy.officialUrl(displayedDeadline.url) != null
                         ) {
                             "Buka di VClass"
                         } else {

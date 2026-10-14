@@ -20,6 +20,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -36,6 +37,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dzaky.vclasstracker.data.remote.VClassClient
 import com.dzaky.vclasstracker.data.remote.VClassDeadline
+import com.dzaky.vclasstracker.ui.components.rememberDeadlineClock
+import com.dzaky.vclasstracker.ui.components.activeDeadlines
 import com.dzaky.vclasstracker.ui.components.AppBottomNavigation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -62,7 +65,7 @@ fun TasksScreen(
     onOpenProfile: () -> Unit = {},
     onOpenTaskDetail: (VClassDeadline) -> Unit = {}
 ) {
-    var deadlines by remember {
+    var loadedDeadlines by remember {
         mutableStateOf<List<VClassDeadline>>(emptyList())
     }
 
@@ -74,7 +77,9 @@ fun TasksScreen(
         mutableStateOf("")
     }
 
-    LaunchedEffect(Unit) {
+    var refresh by remember { mutableStateOf(0) }
+    var failed by remember { mutableStateOf(false) }
+    LaunchedEffect(refresh) {
         loading = true
 
         val result =
@@ -82,7 +87,8 @@ fun TasksScreen(
                 VClassClient.getDeadlines()
             }
 
-        deadlines =
+        failed = !result.success
+        loadedDeadlines =
             result.deadlines
                 .sortedBy {
                     it.deadlineTimestamp
@@ -91,6 +97,9 @@ fun TasksScreen(
         message = result.message
         loading = false
     }
+
+    val now = rememberDeadlineClock()
+    val deadlines = remember(loadedDeadlines, now) { activeDeadlines(loadedDeadlines, now) }
 
     Box(
         modifier = Modifier
@@ -116,6 +125,7 @@ fun TasksScreen(
                     )
             ) {
                 Column {
+                    TextButton(onClick = { refresh++ }, enabled = !loading) { Text("Muat ulang tugas") }
                     Text(
                         text = "Tugas",
                         color = Primary,
@@ -205,7 +215,7 @@ fun TasksScreen(
                                 )
 
                                 Text(
-                                    text = "Belum ada tugas aktif",
+                                    text = if (failed) "Tugas belum dapat dimuat" else "Belum ada tugas aktif",
                                     color = TextPrimary,
                                     fontSize = 16.sp,
                                     fontWeight = FontWeight.Bold
@@ -217,9 +227,7 @@ fun TasksScreen(
 
                                 Text(
                                     text =
-                                        message.ifBlank {
-                                            "Tidak ada deadline dari VClass saat ini."
-                                        },
+                                        if (failed) message else "Tidak ada deadline aktif saat ini.",
                                     color = TextSecondary,
                                     fontSize = 11.sp
                                 )

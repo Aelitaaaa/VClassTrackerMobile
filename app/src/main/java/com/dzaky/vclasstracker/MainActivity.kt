@@ -1,4 +1,4 @@
-﻿package com.dzaky.vclasstracker
+package com.dzaky.vclasstracker
 
 import android.Manifest
 import android.content.Intent
@@ -7,8 +7,16 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material3.Text
+import androidx.compose.material3.Button
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import com.dzaky.vclasstracker.ui.login.clearWebAuthenticationData
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -16,6 +24,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.lifecycleScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,6 +46,8 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
+    private var verifyAfterResume = false
+
     private var notificationTargetPage by mutableStateOf<String?>(null)
     private var notificationTargetDeadlineId by mutableStateOf<String?>(null)
 
@@ -50,7 +62,6 @@ class MainActivity : ComponentActivity() {
 
         handleNotificationIntent(intent)
 
-        VClassClient.initialize(this)
         NotificationHelper.createNotificationChannel(this)
 
         setContent {
@@ -59,7 +70,7 @@ class MainActivity : ComponentActivity() {
                     mutableStateOf<String?>(null)
                 }
 
-                var currentPage by remember {
+                var currentPage by rememberSaveable {
                     mutableStateOf("dashboard")
                 }
 
@@ -71,51 +82,68 @@ class MainActivity : ComponentActivity() {
                     mutableStateOf<VClassDeadline?>(null)
                 }
 
-                LaunchedEffect(Unit) {
-                    val restoredName =
-                        VClassClient.getRestoredDisplayName()
+                var savedDeadlineId by rememberSaveable { mutableStateOf<String?>(null) }
+                val scope = rememberCoroutineScope()
+                val sessionChange by VClassClient.sessionChanges.collectAsState()
+                var restoreAttempt by remember { mutableStateOf(0) }
+                var startupError by remember { mutableStateOf("") }
 
-                    if (restoredName.isNotBlank()) {
-                        val sessionResult =
-                            withContext(Dispatchers.IO) {
-                                VClassClient.getMyCourses()
-                            }
+                fun resetAuthenticatedUi() {
+                    VClassSyncWorker.cancel(this@MainActivity)
+                    VClassSyncWorker.reset(this@MainActivity)
+                    NotificationHelper.clearAll(this@MainActivity)
+                    clearWebAuthenticationData()
+                    selectedDeadline = null
+                    savedDeadlineId = null
+                    notificationTargetDeadlineId = null
+                    notificationTargetPage = null
+                    currentPage = "dashboard"
+                    loggedInUser = null
+                }
 
-                        if (sessionResult.success) {
-                            loggedInUser =
-                                restoredName
-
-                            currentPage =
-                                notificationTargetPage
-                                    ?: "dashboard"
-
-                            notificationTargetPage =
-                                null
-
-                            VClassSyncWorker.schedule(
-                                this@MainActivity
-                            )
-
-                            VClassSyncWorker.runNow(
-                                this@MainActivity
-                            )
-
-                            requestNotificationPermission()
-                        } else {
-                            VClassSyncWorker.cancel(
-                                this@MainActivity
-                            )
-
-                            VClassSyncWorker.reset(
-                                this@MainActivity
-                            )
-
-                            VClassClient.clearSession()
-                        }
+                LaunchedEffect(sessionChange) {
+                    if (loggedInUser != null && !VClassClient.isSessionCurrent(sessionChange)) {
+                        resetAuthenticatedUi()
                     }
+                }
 
-                    checkingSession =
-                        false
+                LaunchedEffect(restoreAttempt) {
+                    checkingSession = true
+                    startupError = ""
+                    val result = withContext(Dispatchers.IO) {
+                        VClassClient.initialize(this@MainActivity)
+                        if (VClassClient.sessionCookies().any { it.name == "MoodleSession" })
+                            VClassClient.verifySession() else null
+                    }
+                    if (result?.success == true) {
+                        loggedInUser = result.displayName
+                        currentPage = notificationTargetPage ?: currentPage
+                        notificationTargetPage = null
+                        if (currentPage == "task_detail" && savedDeadlineId != null) {
+                            notificationTargetDeadlineId = savedDeadlineId
+                            currentPage = "tasks"
+                        }
+                        VClassSyncWorker.schedule(this@MainActivity)
+                        VClassSyncWorker.runNow(this@MainActivity)
+                        requestNotificationPermission()
+                    } else if (result != null && !result.sessionExpired) {
+                        startupError = result.message
+                    } else {
+                        VClassSyncWorker.cancel(this@MainActivity)
+                        VClassSyncWorker.reset(this@MainActivity)
+                        NotificationHelper.clearAll(this@MainActivity)
+                        clearWebAuthenticationData()
+                    }
+                    checkingSession = false
+                }
+
+                BackHandler(enabled = loggedInUser != null && currentPage != "dashboard") {
+                    currentPage = when (currentPage) {
+                        "task_detail" -> "tasks"
+                        "add_course" -> "courses"
+                        else -> "dashboard"
+                    }
+                    if (currentPage != "task_detail") { selectedDeadline = null; savedDeadlineId = null }
                 }
 
                 if (checkingSession) {
@@ -126,6 +154,13 @@ class MainActivity : ComponentActivity() {
                             Alignment.Center
                     ) {
                         CircularProgressIndicator()
+                    }
+                } else if (startupError.isNotBlank()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(startupError)
+                            Button(onClick = { restoreAttempt++ }) { Text("Coba lagi") }
+                        }
                     }
                 } else if (loggedInUser == null) {
                     LoginScreen(
@@ -140,6 +175,7 @@ class MainActivity : ComponentActivity() {
                             notificationTargetPage =
                                 null
 
+                            selectedDeadline = null
                             VClassSyncWorker.reset(
                                 this@MainActivity
                             )
@@ -185,7 +221,7 @@ class MainActivity : ComponentActivity() {
                             val matchedDeadline =
                                 deadlineResult.deadlines
                                     .firstOrNull { deadline ->
-                                        deadline.id.toString() ==
+                                        deadline.id ==
                                             targetDeadlineId
                                     }
 
@@ -227,9 +263,8 @@ class MainActivity : ComponentActivity() {
                                         "profile"
                                 },
                                 onOpenTaskDetail = { deadline ->
-                                    selectedDeadline =
-                                        deadline
-
+                                    selectedDeadline = deadline
+                                    savedDeadlineId = deadline.id
                                     currentPage =
                                         "task_detail"
                                 }
@@ -244,13 +279,13 @@ class MainActivity : ComponentActivity() {
                                 TaskDetailScreen(
                                     deadline = deadline,
                                     onBack = {
-                                        currentPage =
-                                            "tasks"
+                                        selectedDeadline = null
+                                        savedDeadlineId = null
+                                        currentPage = "tasks"
                                     }
                                 )
                             } else {
-                                currentPage =
-                                    "tasks"
+                                LaunchedEffect(Unit) { currentPage = "tasks" }
                             }
                         }
 
@@ -301,21 +336,14 @@ class MainActivity : ComponentActivity() {
                                         "dashboard"
                                 },
                                 onLogout = {
-                                    VClassSyncWorker.cancel(
-                                        this@MainActivity
-                                    )
-
-                                    VClassSyncWorker.reset(
-                                        this@MainActivity
-                                    )
-
-                                    VClassClient.clearSession()
-
-                                    currentPage =
-                                        "dashboard"
-
-                                    loggedInUser =
-                                        null
+                                    if (!checkingSession) {
+                                        checkingSession = true
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) { VClassClient.clearSession() }
+                                            resetAuthenticatedUi()
+                                            checkingSession = false
+                                        }
+                                    }
                                 },
                                 onOpenDashboard = {
                                     currentPage =
@@ -356,6 +384,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onPause() {
+        verifyAfterResume = true
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (verifyAfterResume && VClassClient.getRestoredDisplayName().isNotBlank()) {
+            lifecycleScope.launch { withContext(Dispatchers.IO) { VClassClient.verifySession() } }
+        }
+        verifyAfterResume = false
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -369,11 +410,7 @@ class MainActivity : ComponentActivity() {
             ) == true
         ) {
             notificationTargetDeadlineId =
-                intent.extras
-                    ?.get(
-                        "open_deadline_id"
-                    )
-                    ?.toString()
+                intent.getStringExtra("open_deadline_id")
 
             notificationTargetPage =
                 "tasks"
