@@ -20,6 +20,12 @@ The current theme omits the old `.usertext` display-name elements and does not i
 
 Browser sign-in and HTML inspection do not verify Android WebView cookie handoff, app restart, logout, or a completed enrollment. Those remain device/runtime checks. No account cookies or private student data were put in source or fixtures.
 
+## Android user confirmation
+
+On 14 October 2026, the user reported that the updated debug APK worked after being asked to test Microsoft sign-in, My Courses, and reopening the app. This is recorded as user-reported Android login success, rather than an independently observed device test. Completed enrollment and membership refresh, logout, deadline/task behavior, notifications, and scheduled background sync have not been individually confirmed on the device.
+
+The APK tested was built from `f248cb50ebc48093797bf4489148e6f11415122a` in successful PR CI run `38570025455`. Its SHA-256 is `bcb3d5db1632a9e201cafce97de534ef99d3595a35e13417056049238fd8ae94`. That run passed 17 JVM tests, both lint checks with zero errors, and both debug and unsigned release builds. This follow-up changes documentation only. The PR remains open while the remaining relevant runtime checks are pending. No release is created automatically.
+
 ## Baseline automated checks
 
 The baseline fifteen JVM test cases passed through Gradle with JUnit 4.13.2. The initial thirteen cases also passed with the standalone Kotlin 2.3.20/JUnit runner. They cover:
@@ -54,7 +60,7 @@ A lightweight clock updates remaining deadline time while a screen stays open. E
 
 ## Runtime checks still required
 
-- Fresh Microsoft login, cancellation, Android Back, return to VClass, and MFA when requested.
+- Cancellation, Android Back, and MFA when requested; successful Android Microsoft login is user-reported above.
 - Restart with a valid session; expired-session return to login; a temporary network failure during startup.
 - Logout while sync is running; account changes; absence of old tasks and notifications.
 - Live searches such as `1IA10`, `Algoritma`, course code, partial title, and semester when matching data exists.
