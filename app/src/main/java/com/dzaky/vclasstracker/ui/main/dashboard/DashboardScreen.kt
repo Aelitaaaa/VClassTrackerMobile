@@ -42,6 +42,8 @@ import com.dzaky.vclasstracker.assistant.KaedePersona
 import com.dzaky.vclasstracker.data.remote.VClassClient
 import com.dzaky.vclasstracker.data.remote.VClassCourse
 import com.dzaky.vclasstracker.data.remote.VClassDeadline
+import com.dzaky.vclasstracker.ui.components.rememberDeadlineClock
+import com.dzaky.vclasstracker.ui.components.activeDeadlines
 import com.dzaky.vclasstracker.ui.components.AppBottomNavigation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -81,7 +83,7 @@ fun DashboardScreen(
         )
     }
 
-    var deadlines by remember {
+    var loadedDeadlines by remember {
         mutableStateOf<List<VClassDeadline>>(
             emptyList()
         )
@@ -130,6 +132,7 @@ fun DashboardScreen(
             )
         }
 
+    var deadlineFailed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         loadingCourses = true
         loadingDeadlines = true
@@ -157,7 +160,8 @@ fun DashboardScreen(
                 VClassClient.getDeadlines()
             }
 
-        deadlines =
+        deadlineFailed = !deadlineResult.success
+        loadedDeadlines =
             deadlineResult.deadlines
 
         deadlineMessage =
@@ -166,6 +170,9 @@ fun DashboardScreen(
         loadingDeadlines =
             false
     }
+
+    val now = rememberDeadlineClock()
+    val deadlines = remember(loadedDeadlines, now) { activeDeadlines(loadedDeadlines, now) }
 
     val semesters =
         courses
@@ -200,6 +207,7 @@ fun DashboardScreen(
             loadingDeadlines ->
                 R.drawable.kaede_avatar
 
+            deadlineFailed -> R.drawable.kaede_avatar
             deadlines.isEmpty() ->
                 R.drawable.kaede_happy
 
@@ -216,6 +224,7 @@ fun DashboardScreen(
             loadingDeadlines ->
                 kaedeGreeting
 
+            deadlineFailed -> deadlineMessage
             deadlines.isEmpty() ->
                 KaedePersona.noDeadline(
                     displayName
@@ -694,8 +703,7 @@ fun DashboardScreen(
 
                     else -> {
                         EmptyDeadlineCard(
-                            message =
-                                deadlineMessage
+                            message = if (deadlineFailed) deadlineMessage else "Tidak ada deadline aktif saat ini."
                         )
                     }
                 }
