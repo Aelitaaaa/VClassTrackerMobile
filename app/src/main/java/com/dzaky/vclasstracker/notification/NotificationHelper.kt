@@ -1,6 +1,7 @@
 package com.dzaky.vclasstracker.notification
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -16,6 +17,7 @@ import com.dzaky.vclasstracker.MainActivity
 import com.dzaky.vclasstracker.R
 import com.dzaky.vclasstracker.assistant.KaedePersona
 import com.dzaky.vclasstracker.data.remote.VClassDeadline
+import com.dzaky.vclasstracker.data.remote.VClassClient
 
 object NotificationHelper {
 
@@ -68,10 +70,12 @@ object NotificationHelper {
         }
     }
 
+    @SuppressLint("MissingPermission") // Checked below; also handle a permission revoked before notify.
     fun showDeadlineNotification(
         context: Context,
         displayName: String,
-        deadline: VClassDeadline
+        deadline: VClassDeadline,
+        sessionVersion: Long = VClassClient.currentSessionVersion()
     ): Boolean {
         createNotificationChannel(
             context
@@ -169,9 +173,8 @@ object NotificationHelper {
                 .setAutoCancel(
                     true
                 )
-                .setOnlyAlertOnce(
-                    true
-                )
+                .setOnlyAlertOnce(false)
+                .setTimeoutAfter(maxOf(1000L, deadline.deadlineTimestamp * 1000L - System.currentTimeMillis()))
                 .setPriority(
                     priority
                 )
@@ -193,22 +196,21 @@ object NotificationHelper {
                 .hashCode() and
                 0x7fffffff
 
-        NotificationManagerCompat
-            .from(
-                context
-            )
-            .notify(
-                notificationId,
-                builder.build()
-            )
-
-        return true
+        return VClassClient.withCurrentSession(sessionVersion) {
+            if (deadline.deadlineTimestamp <= System.currentTimeMillis() / 1000L) false
+            else try {
+                NotificationManagerCompat.from(context).notify(notificationId, builder.build())
+                true
+            } catch (_: SecurityException) { false }
+        } ?: false
     }
 
+    @SuppressLint("MissingPermission") // Checked below; also handle a permission revoked before notify.
     fun showNewTaskNotification(
         context: Context,
         displayName: String,
-        deadline: VClassDeadline
+        deadline: VClassDeadline,
+        sessionVersion: Long = VClassClient.currentSessionVersion()
     ): Boolean {
         createNotificationChannel(
             context
@@ -280,9 +282,8 @@ object NotificationHelper {
                 .setAutoCancel(
                     true
                 )
-                .setOnlyAlertOnce(
-                    true
-                )
+                .setOnlyAlertOnce(false)
+                .setTimeoutAfter(maxOf(1000L, deadline.deadlineTimestamp * 1000L - System.currentTimeMillis()))
                 .setPriority(
                     NotificationCompat.PRIORITY_HIGH
                 )
@@ -299,24 +300,19 @@ object NotificationHelper {
             )
         }
 
-        val notificationId =
-            (
-                deadline.id +
-                    "-new"
-                )
-                .hashCode() and
-                0x7fffffff
+        val notificationId = deadline.id.hashCode() and 0x7fffffff
 
-        NotificationManagerCompat
-            .from(
-                context
-            )
-            .notify(
-                notificationId,
-                builder.build()
-            )
+        return VClassClient.withCurrentSession(sessionVersion) {
+            if (deadline.deadlineTimestamp <= System.currentTimeMillis() / 1000L) false
+            else try {
+                NotificationManagerCompat.from(context).notify(notificationId, builder.build())
+                true
+            } catch (_: SecurityException) { false }
+        } ?: false
+    }
 
-        return true
+    fun clearAll(context: Context) {
+        NotificationManagerCompat.from(context).cancelAll()
     }
 
     private fun createDeadlinePendingIntent(
@@ -330,7 +326,7 @@ object NotificationHelper {
             ).apply {
                 flags =
                     Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
 
                 putExtra(
                     "open_deadline_id",
@@ -352,17 +348,19 @@ object NotificationHelper {
         resourceId: Int
     ): Bitmap? {
         return try {
-            BitmapFactory.decodeResource(
-                context.resources,
-                resourceId
-            )
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeResource(context.resources, resourceId, bounds)
+            var sample = 1
+            while (bounds.outWidth / sample > 256 || bounds.outHeight / sample > 256) sample *= 2
+            BitmapFactory.decodeResource(context.resources, resourceId, BitmapFactory.Options().apply { inSampleSize = sample })
         } catch (_: Exception) {
             null
         }
     }
 
     private fun isThreeHoursOrLess(
-        deadline: VClassDeadline
+        deadline: VClassDeadline,
+        sessionVersion: Long = VClassClient.currentSessionVersion()
     ): Boolean {
         val now =
             System.currentTimeMillis() /
@@ -379,6 +377,9 @@ object NotificationHelper {
     private fun hasNotificationPermission(
         context: Context
     ): Boolean {
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
+        val channel = context.getSystemService(NotificationManager::class.java).getNotificationChannel(CHANNEL_ID)
+        if (channel?.importance == NotificationManager.IMPORTANCE_NONE) return false
         if (
             Build.VERSION.SDK_INT <
             Build.VERSION_CODES.TIRAMISU
