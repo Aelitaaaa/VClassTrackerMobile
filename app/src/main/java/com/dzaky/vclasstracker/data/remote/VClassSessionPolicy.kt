@@ -55,6 +55,26 @@ internal object VClassSessionPolicy {
         return userId > 0 && doc.selectFirst(".usermenu, [data-region=usermenu]") != null
     }
 
+    fun userId(html: String): Long {
+        val doc = Jsoup.parse(html, ORIGIN)
+        val ids = doc.select(".logininfo a[href], .usermenu a[href], [data-region=usermenu] a[href]")
+            .mapNotNull { link ->
+                officialUrl(link.absUrl("href"))?.takeIf {
+                    it.encodedPath == "/user/profile.php" || it.encodedPath == "/user/view.php"
+                }?.queryParameter("id")?.toLongOrNull()?.takeIf { it > 0 }
+            }.distinct()
+        if (ids.isNotEmpty()) return ids.singleOrNull() ?: 0
+        return doc.select("script").firstNotNullOfOrNull { script ->
+            val config = Regex("(?s)\\bM\\.cfg\\s*=\\s*\\{.*?\\}")
+                .find(script.data())?.value ?: return@firstNotNullOfOrNull null
+            Regex("[\"']userid[\"']\\s*:\\s*[\"']?(\\d+)")
+                .find(config)?.groupValues?.get(1)?.toLongOrNull()?.takeIf { it > 0 }
+        } ?: 0
+    }
+
+    fun sameAccount(expectedUserId: Long, actualUserId: Long): Boolean =
+        expectedUserId > 0 && actualUserId > 0 && expectedUserId == actualUserId
+
     fun isAuthPath(path: String): Boolean =
         path.startsWith("/login/") || path.startsWith("/auth/") ||
             path == "/admin/oauth2callback.php"

@@ -56,6 +56,8 @@ object VClassClient {
     @Volatile private var restoredDisplayName =
         ""
 
+    @Volatile private var authenticatedUserId = 0L
+
     private val client =
         OkHttpClient.Builder()
             .cookieJar(cookieJar)
@@ -177,6 +179,7 @@ object VClassClient {
         }
 
         restoredDisplayName = ""
+        authenticatedUserId = 0L
         changes.value = generation.get()
     }
 
@@ -202,6 +205,7 @@ object VClassClient {
         val name = extractDisplayName(Jsoup.parse(page.html, BASE_URL)).ifBlank { "Mahasiswa" }
         return try {
             withCurrentSession(version) {
+                authenticatedUserId = VClassSessionPolicy.userId(page.html)
                 saveCurrentSession(name)
                 LoginResult(true, "Sesi VClass terverifikasi.", name)
             } ?: LoginResult(false, "Sesi VClass telah berubah.", sessionExpired = true)
@@ -224,15 +228,17 @@ object VClassClient {
                     return LoginResult(false, "Login VClass belum selesai. Lanjutkan melalui halaman resmi.")
                 }
                 val name = extractDisplayName(Jsoup.parse(html, BASE_URL)).ifBlank { "Mahasiswa" }
+                val candidateUserId = VClassSessionPolicy.userId(html)
                 synchronized(this) {
                     if (version != generation.get()) return LoginResult(false, "Login dibatalkan.")
-                    if (sameAccountOnly && restoredDisplayName.isNotBlank() && restoredDisplayName != name) {
-                        return LoginResult(false, "Akun pada halaman resmi berbeda. Keluar dari aplikasi lalu masuk kembali.")
+                    if (sameAccountOnly && !VClassSessionPolicy.sameAccount(authenticatedUserId, candidateUserId)) {
+                        return LoginResult(false, "Identitas akun pada halaman resmi tidak sesuai atau belum dapat dipastikan. Keluar dari aplikasi lalu masuk kembali.")
                     }
                     generation.incrementAndGet()
                     client.dispatcher.cancelAll()
                     cookieJar.replaceAll(candidateJar.getAll())
                     try { saveCurrentSession(name) } catch (e: Exception) { clearSession(); throw e }
+                    authenticatedUserId = candidateUserId
                     changes.value = generation.get()
                 }
                 LoginResult(true, "Login VClass berhasil.", name)
@@ -1662,7 +1668,9 @@ object VClassClient {
                 "[data-region=usermenu] .usertext",
                 ".userbutton .usertext",
                 ".usertext",
-                ".usermenu .usertext"
+                ".usermenu .usertext",
+                ".logininfo a[href*='/user/profile.php']",
+                ".logininfo a[href*='/user/view.php']"
             )
 
         for (
