@@ -10,9 +10,19 @@ On 14 October 2026, the official login page offered separate Google staff and Mi
 
 This inspection confirms the public entry and redirect. It does not validate a student's authenticated course catalog, enrollment forms, MFA, or an Android WebView session handoff.
 
-## Automated checks
+## Authenticated browser inspection
 
-Fifteen JVM test cases passed through Gradle with JUnit 4.13.2. The initial thirteen cases also passed with the standalone Kotlin 2.3.20/JUnit runner. They cover:
+On 14 October 2026, the user completed Microsoft sign-in themselves in Cloud Browser and returned to authenticated VClass `/my/`. The page had a logout link and two distinct enrolled-course cards. The same two courses appeared in Kursusku. The `Algoritma` query had an explicit empty result, while `Praktikum` returned 16 distinct catalog course IDs through `/course/search.php?search=Praktikum`. Course titles and card selectors matched the existing parser. No native search pagination was needed for those results.
+
+An unenrolled course redirected to `/enrol/index.php` and offered self-enrollment without a key through an official single-button GET form containing `id`, `action`, and `sesskey`. The application routes this unsupported native form through the official enrollment page, then checks My Courses after returning. The enrollment button was not submitted during inspection; the account membership was not changed.
+
+The current theme omits the old `.usertext` display-name elements and does not include a user ID in `M.cfg`. Its own-account footer profile link provides the account ID and display name. Session verification now uses that footer fallback, and enrollment-browser cookie handoff compares account IDs instead of display names. Missing or conflicting identity is rejected. Two synthetic regression tests cover identical display names, missing identity, other users, foreign links, and conflicting profile IDs.
+
+Browser sign-in and HTML inspection do not verify Android WebView cookie handoff, app restart, logout, or a completed enrollment. Those remain device/runtime checks. No account cookies or private student data were put in source or fixtures.
+
+## Baseline automated checks
+
+The baseline fifteen JVM test cases passed through Gradle with JUnit 4.13.2. The initial thirteen cases also passed with the standalone Kotlin 2.3.20/JUnit runner. They cover:
 
 - authenticated-page detection and rejection of login/callback/anonymous pages;
 - VClass-only cookie import, expiration, deduplication, logout, and stale-response rejection;
@@ -25,7 +35,7 @@ Fifteen JVM test cases passed through Gradle with JUnit 4.13.2. The initial thir
 
 All fixtures are synthetic and contain no private student data. The Keystore implementation, WebView lifecycle, notification permission behavior, and WorkManager need Android runtime testing; these JVM tests do not simulate their success.
 
-All required Gradle checks passed on the final source:
+Before the authenticated-browser follow-up, all required Gradle checks passed:
 
 | Check | Result |
 | --- | --- |
