@@ -65,4 +65,27 @@ class VClassSessionPolicyTest {
         jar.saveFromResponse(origin.toHttpUrl(), listOf(old))
         assertEquals("new-fixture", jar.getAll().single().value)
     }
+
+    @Test fun `same account handoff checks own profile ID when names are identical or absent`() {
+        fun page(id: Int) = """
+            <div class="usermenu"><a href="/user/profile.php">Profil</a></div>
+            <div class="logininfo"><a href="/user/profile.php?id=$id">Mahasiswa</a></div>
+            <div class="block_online_users"><a href="/user/profile.php?id=99">Other fixture user</a></div>
+        """.trimIndent()
+        val current = VClassSessionPolicy.userId(page(42))
+        assertEquals(42L, current)
+        assertTrue(VClassSessionPolicy.sameAccount(current, VClassSessionPolicy.userId(page(42))))
+        assertFalse(VClassSessionPolicy.sameAccount(current, VClassSessionPolicy.userId(page(43))))
+        assertFalse(VClassSessionPolicy.sameAccount(current, VClassSessionPolicy.userId("<div class='usermenu'>Mahasiswa</div>")))
+        assertFalse(VClassSessionPolicy.sameAccount(0, current))
+        assertEquals(42L, VClassSessionPolicy.userId("<script>M.cfg = {\"userid\":42};</script>"))
+    }
+
+    @Test fun `identity parser rejects unrelated foreign invalid or conflicting profile IDs`() {
+        assertEquals(0L, VClassSessionPolicy.userId("<div class='block_online_users'><a href='/user/profile.php?id=42'>Fixture</a></div>"))
+        assertEquals(0L, VClassSessionPolicy.userId("<script>var anotherUser = {\"userid\":42};</script>"))
+        assertEquals(0L, VClassSessionPolicy.userId("<div class='logininfo'><a href='https://other.invalid/user/profile.php?id=42'>Fixture</a></div>"))
+        assertEquals(0L, VClassSessionPolicy.userId("<div class='logininfo'><a href='/user/profile.php?id=-1'>Fixture</a></div>"))
+        assertEquals(0L, VClassSessionPolicy.userId("<div class='logininfo'><a href='/user/profile.php?id=42'>Fixture</a></div><div class='usermenu'><a href='/user/profile.php?id=43'>Profil</a></div>"))
+    }
 }
