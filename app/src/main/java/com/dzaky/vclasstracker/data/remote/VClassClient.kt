@@ -2,17 +2,17 @@ package com.dzaky.vclasstracker.data.remote
 
 import android.content.Context
 import com.dzaky.vclasstracker.data.local.VClassSessionStore
-import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
-import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import okhttp3.Cookie
-import okhttp3.CookieJar
 import okhttp3.FormBody
-import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -27,9 +27,6 @@ object VClassClient {
 
     private const val BASE_URL =
         "https://v-class.gunadarma.ac.id"
-
-    private const val LOGIN_URL =
-        "$BASE_URL/login/index.php"
 
     private const val MY_COURSES_URL =
         "$BASE_URL/my/"
@@ -46,24 +43,35 @@ object VClassClient {
     private val wibZone =
         ZoneId.of("Asia/Jakarta")
 
-    private val cookieJar =
-        MemoryCookieJar()
+    private val requestVersion = ThreadLocal<Long>()
+    private val cookieJar = MemoryCookieJar { requestVersion.get() == generation.get() }
 
     private var applicationContext: Context? =
         null
 
-    private var restoredDisplayName =
+    private val generation = AtomicLong(0)
+    private val changes = MutableStateFlow(0L)
+    val sessionChanges = changes.asStateFlow()
+
+    @Volatile private var restoredDisplayName =
         ""
 
     private val client =
         OkHttpClient.Builder()
             .cookieJar(cookieJar)
             .followRedirects(true)
-            .followSslRedirects(true)
+            .followSslRedirects(false)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(60, TimeUnit.SECONDS)
             .addInterceptor { chain ->
+                val version = generation.get()
+                requestVersion.set(version)
                 val request =
                     chain.request()
                         .newBuilder()
+                        .tag(SessionVersion::class.java, SessionVersion(version))
                         .header(
                             "User-Agent",
                             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/128.0.0.0 Mobile Safari/537.36"
@@ -74,16 +82,28 @@ object VClassClient {
                         )
                         .build()
 
-                chain.proceed(request)
+                try { chain.proceed(request) } finally { requestVersion.remove() }
+            }
+            .addNetworkInterceptor { chain ->
+                val version = chain.request().tag(SessionVersion::class.java)?.value
+                if (version != generation.get()) throw SessionExpiredException()
+                if (VClassSessionPolicy.officialUrl(chain.request().url.toString()) == null) {
+                    throw SessionExpiredException()
+                }
+                val response = chain.proceed(chain.request())
+                if (version != generation.get()) {
+                    response.close()
+                    throw SessionExpiredException()
+                }
+                response
             }
             .build()
 
-    fun initialize(
+    @Synchronized fun initialize(
         context: Context
     ) {
-        applicationContext =
-            context.applicationContext
-
+        if (applicationContext != null) return
+        applicationContext = context.applicationContext
         restoreSavedSession()
     }
 
@@ -125,7 +145,7 @@ object VClassClient {
     ) {
         val context =
             applicationContext
-                ?: return
+                ?: throw IllegalStateException("VClass client is not initialized")
 
         val cookies =
             cookieJar.getAll()
@@ -145,7 +165,9 @@ object VClassClient {
             displayName
     }
 
-    fun clearSession() {
+    @Synchronized fun clearSession() {
+        generation.incrementAndGet()
+        client.dispatcher.cancelAll()
         cookieJar.clear()
 
         applicationContext?.let { context ->
@@ -154,188 +176,74 @@ object VClassClient {
             ).clear()
         }
 
-        restoredDisplayName =
-            ""
+        restoredDisplayName = ""
+        changes.value = generation.get()
     }
 
-    fun login(
-        username: String,
-        password: String
-    ): LoginResult {
+    fun currentSessionVersion(): Long = generation.get()
+
+    fun isSessionCurrent(version: Long): Boolean =
+        version == generation.get() && cookieJar.getAll().any { it.name == "MoodleSession" }
+
+    fun sessionCookies(): List<okhttp3.Cookie> = cookieJar.getAll()
+
+    internal fun <T> withCurrentSession(version: Long, action: () -> T): T? = synchronized(this) {
+        if (isSessionCurrent(version)) action() else null
+    }
+
+    internal fun withNoSession(action: () -> Unit) = synchronized(this) {
+        if (cookieJar.getAll().none { it.name == "MoodleSession" }) action()
+    }
+
+    fun verifySession(): LoginResult {
+        val version = generation.get()
+        val page = getAuthenticatedPage(MY_COURSES_URL)
+        if (!page.success) return LoginResult(false, page.message, sessionExpired = page.sessionExpired)
+        val name = extractDisplayName(Jsoup.parse(page.html, BASE_URL)).ifBlank { "Mahasiswa" }
         return try {
-            val loginPageRequest =
-                Request.Builder()
-                    .url(LOGIN_URL)
-                    .get()
-                    .build()
+            withCurrentSession(version) {
+                saveCurrentSession(name)
+                LoginResult(true, "Sesi VClass terverifikasi.", name)
+            } ?: LoginResult(false, "Sesi VClass telah berubah.", sessionExpired = true)
+        } catch (_: Exception) {
+            LoginResult(false, "Tidak dapat menyimpan sesi terenkripsi. Coba masuk kembali.")
+        }
+    }
 
-            val loginPageHtml =
-                client
-                    .newCall(
-                        loginPageRequest
-                    )
-                    .execute()
-                    .use { response ->
-
-                        if (!response.isSuccessful) {
-                            return LoginResult(
-                                success = false,
-                                message = "Gagal membuka halaman login VClass."
-                            )
-                        }
-
-                        response.body
-                            ?.string()
-                            .orEmpty()
-                    }
-
-            val document =
-                Jsoup.parse(
-                    loginPageHtml
-                )
-
-            val loginToken =
-                document
-                    .selectFirst(
-                        "input[name=logintoken]"
-                    )
-                    ?.attr(
-                        "value"
-                    )
-                    .orEmpty()
-
-            val formBuilder =
-                FormBody.Builder()
-                    .add(
-                        "username",
-                        username
-                    )
-                    .add(
-                        "password",
-                        password
-                    )
-                    .add(
-                        "rememberusername",
-                        "0"
-                    )
-                    .add(
-                        "anchor",
-                        ""
-                    )
-
-            if (loginToken.isNotBlank()) {
-                formBuilder.add(
-                    "logintoken",
-                    loginToken
-                )
-            }
-
-            val loginRequest =
-                Request.Builder()
-                    .url(LOGIN_URL)
-                    .post(
-                        formBuilder.build()
-                    )
-                    .build()
-
-            client
-                .newCall(
-                    loginRequest
-                )
-                .execute()
-                .use { response ->
-
-                    val html =
-                        response.body
-                            ?.string()
-                            .orEmpty()
-
-                    val finalUrl =
-                        response.request
-                            .url
-                            .toString()
-
-                    val resultDocument =
-                        Jsoup.parse(
-                            html,
-                            BASE_URL
-                        )
-
-                    val stillHasPasswordField =
-                        resultDocument.selectFirst(
-                            "input[name=password]"
-                        ) != null
-
-                    val hasLogoutLink =
-                        resultDocument.selectFirst(
-                            "a[href*=login/logout.php]"
-                        ) != null
-
-                    val errorText =
-                        resultDocument
-                            .selectFirst(
-                                ".loginerrors, .alert-danger, .errormessage"
-                            )
-                            ?.text()
-                            .orEmpty()
-
-                    if (
-                        finalUrl.contains(
-                            "login/index.php"
-                        ) ||
-                        (
-                            stillHasPasswordField &&
-                                !hasLogoutLink
-                            )
-                    ) {
-                        return LoginResult(
-                            success = false,
-                            message =
-                                if (errorText.isNotBlank()) {
-                                    errorText
-                                } else {
-                                    "Username atau password VClass salah."
-                                }
-                        )
-                    }
-
-                    val displayName =
-                        extractDisplayName(
-                            resultDocument
-                        )
-
-                    val finalDisplayName =
-                        displayName.ifBlank {
-                            username
-                        }
-
-                    saveCurrentSession(
-                        finalDisplayName
-                    )
-
-                    LoginResult(
-                        success = true,
-                        message =
-                            if (displayName.isNotBlank()) {
-                                "Login berhasil sebagai $displayName"
-                            } else {
-                                "Login VClass berhasil."
-                            },
-                        displayName =
-                            finalDisplayName
-                    )
+    fun completeMicrosoftLogin(cookieHeader: String, sameAccountOnly: Boolean = false): LoginResult {
+        val imported = VClassSessionPolicy.importHeader(cookieHeader)
+        if (imported.isEmpty()) return LoginResult(false, "Sesi VClass belum tersedia. Selesaikan login di halaman resmi.")
+        val version = generation.get()
+        val candidateJar = MemoryCookieJar().apply { replaceAll(imported) }
+        val candidateClient = client.newBuilder().cookieJar(candidateJar).build()
+        return try {
+            candidateClient.newCall(Request.Builder().url(MY_COURSES_URL).build()).execute().use { response ->
+                val html = response.body?.string().orEmpty()
+                if (!response.isSuccessful) return LoginResult(false, "VClass mengembalikan HTTP ${response.code}.")
+                if (!VClassSessionPolicy.authenticated(response.request.url.toString(), html)) {
+                    return LoginResult(false, "Login VClass belum selesai. Lanjutkan melalui halaman resmi.")
                 }
-        } catch (e: Exception) {
-            LoginResult(
-                success = false,
-                message =
-                    e.message
-                        ?: "Terjadi kesalahan saat menghubungi VClass."
-            )
+                val name = extractDisplayName(Jsoup.parse(html, BASE_URL)).ifBlank { "Mahasiswa" }
+                synchronized(this) {
+                    if (version != generation.get()) return LoginResult(false, "Login dibatalkan.")
+                    if (sameAccountOnly && restoredDisplayName.isNotBlank() && restoredDisplayName != name) {
+                        return LoginResult(false, "Akun pada halaman resmi berbeda. Keluar dari aplikasi lalu masuk kembali.")
+                    }
+                    generation.incrementAndGet()
+                    client.dispatcher.cancelAll()
+                    cookieJar.replaceAll(candidateJar.getAll())
+                    try { saveCurrentSession(name) } catch (e: Exception) { clearSession(); throw e }
+                    changes.value = generation.get()
+                }
+                LoginResult(true, "Login VClass berhasil.", name)
+            }
+        } catch (_: Exception) {
+            LoginResult(false, "Sesi VClass belum dapat diverifikasi. Periksa koneksi dan coba lagi.")
         }
     }
 
     fun getMyCourses(): CoursesResult {
+        val version = generation.get()
         return try {
             val page =
                 getAuthenticatedPage(
@@ -345,7 +253,8 @@ object VClassClient {
             if (!page.success) {
                 return CoursesResult(
                     success = false,
-                    message = page.message
+                    message = page.message,
+                    sessionExpired = page.sessionExpired
                 )
             }
 
@@ -360,12 +269,9 @@ object VClassClient {
                         sesskey
                     )
 
-                if (ajaxCourses.isNotEmpty()) {
-                    return CoursesResult(
-                        success = true,
-                        courses = ajaxCourses,
-                        message = "${ajaxCourses.size} mata kuliah ditemukan."
-                    )
+                if (!isSessionCurrent(version)) throw SessionExpiredException()
+                if (ajaxCourses != null) {
+                    return CoursesResult(true, ajaxCourses, if (ajaxCourses.isEmpty()) "Belum ada mata kuliah terdaftar." else "${ajaxCourses.size} mata kuliah ditemukan.")
                 }
             }
 
@@ -374,6 +280,14 @@ object VClassClient {
                     page.html
                 )
 
+            val htmlCourseText = Jsoup.parse(page.html).select("#region-main, [role=main]").text().lowercase()
+            val explicitlyEmpty = "no courses" in htmlCourseText || "not enrolled" in htmlCourseText ||
+                "tidak ada kursus" in htmlCourseText || "tidak ada mata kuliah" in htmlCourseText ||
+                "belum ada mata kuliah" in htmlCourseText || "belum terdaftar" in htmlCourseText
+            if (htmlCourses.isEmpty() && !explicitlyEmpty) {
+                return CoursesResult(false, message = "Daftar kelas belum dapat dibaca dari VClass. Coba sinkronkan kembali.")
+            }
+            if (!isSessionCurrent(version)) throw SessionExpiredException()
             CoursesResult(
                 success = true,
                 courses = htmlCourses,
@@ -384,74 +298,112 @@ object VClassClient {
                         "Belum ada mata kuliah ditemukan."
                     }
             )
-        } catch (e: Exception) {
+        } catch (_: SessionExpiredException) {
+            synchronized(this) { if (version == generation.get()) clearSession() }
+            return CoursesResult(false, message = "Sesi VClass berakhir. Masuk kembali dengan Microsoft.", sessionExpired = true)
+        } catch (_: Exception) {
             CoursesResult(
                 success = false,
-                message =
-                    e.message
-                        ?: "Gagal mengambil daftar mata kuliah."
+                message = "Tidak dapat menghubungi VClass. Periksa koneksi dan coba lagi."
             )
         }
     }
 
-    fun searchCourses(
-        query: String
-    ): SearchCoursesResult {
-        if (query.trim().length < 2) {
-            return SearchCoursesResult(
-                success = false,
-                message = "Masukkan minimal 2 karakter untuk mencari kelas."
-            )
+    fun searchCourses(query: String, pageIndex: Int = 0): SearchCoursesResult {
+        val value = query.trim()
+        if (value.length < 2 || value.length > 200 || pageIndex !in 0..1000) {
+            return SearchCoursesResult(false, message = "Masukkan 2–200 karakter untuk mencari kelas.")
         }
-
         return try {
-            val encodedQuery =
-                URLEncoder.encode(
-                    query.trim(),
-                    "UTF-8"
-                )
-
-            val searchUrl =
-                "$COURSE_SEARCH_URL?search=$encodedQuery"
-
-            val page =
-                getAuthenticatedPage(
-                    searchUrl
-                )
-
-            if (!page.success) {
-                return SearchCoursesResult(
-                    success = false,
-                    message = page.message
-                )
-            }
-
-            val courses =
-                parseSearchCourses(
-                    page.html
-                )
-
-            SearchCoursesResult(
-                success = true,
-                courses = courses,
-                message =
-                    if (courses.isEmpty()) {
-                        "Tidak ada kelas yang cocok."
-                    } else {
-                        "${courses.size} kelas ditemukan."
-                    }
-            )
-        } catch (e: Exception) {
-            SearchCoursesResult(
-                success = false,
-                message =
-                    e.message
-                        ?: "Terjadi kesalahan saat mencari kelas."
-            )
+            val url = COURSE_SEARCH_URL.toHttpUrl().newBuilder()
+                .addQueryParameter("search", value).addQueryParameter("page", pageIndex.toString()).build()
+            val page = getAuthenticatedPage(url.toString())
+            if (!page.success) return SearchCoursesResult(false, message = page.message, sessionExpired = page.sessionExpired)
+            parseCatalogPage(page.html, value, pageIndex)
+        } catch (_: Exception) {
+            SearchCoursesResult(false, message = "Tidak dapat mencari kelas. Periksa koneksi dan coba lagi.")
         }
+    }
+
+    internal fun parseCatalogPage(html: String, query: String, currentPage: Int): SearchCoursesResult {
+        val courses = parseSearchCourses(html)
+        val doc = Jsoup.parse(html, COURSE_SEARCH_URL)
+        val text = doc.select("#region-main, [role=main]").text().ifBlank { doc.body().text() }.lowercase()
+        val empty = "no courses" in text || "no results" in text || "tidak ada" in text ||
+            "tidak ditemukan" in text || Regex("(?:search results|hasil pencarian)\\s*:\\s*0").containsMatchIn(text)
+        if (courses.isEmpty() && !empty) {
+            return SearchCoursesResult(false, message = "Format hasil pencarian VClass belum dapat dibaca. Coba lagi atau gunakan pencarian resmi.")
+        }
+        return SearchCoursesResult(true, courses,
+            if (courses.isEmpty()) "Tidak ada kelas yang cocok." else "${courses.size} kelas ditemukan.",
+            nextPage = nextSearchPage(html, query, currentPage))
+    }
+
+    internal fun nextSearchPage(html: String, query: String, currentPage: Int): Int? =
+        Jsoup.parse(html, COURSE_SEARCH_URL).select(".pagination a[href], .paging a[href], a[rel=next]")
+            .mapNotNull { node ->
+                VClassSessionPolicy.officialUrl(node.absUrl("href"))?.takeIf {
+                    it.encodedPath == "/course/search.php" && it.queryParameter("search") == query
+                }?.queryParameter("page")?.toIntOrNull()
+            }.filter { it > currentPage && it <= 1000 }.minOrNull()
+
+    private val enrollingCourseIds = mutableSetOf<String>()
+
+    internal fun inspectEnrollment(course: VClassCourse): EnrollmentResult {
+        val enrolled = getMyCourses()
+        if (!enrolled.success) return EnrollmentResult(false, message = enrolled.message)
+        if (enrolled.courses.any { it.id == course.id }) {
+            return EnrollmentResult(true, EnrollmentState.ALREADY_ENROLLED, "Sudah terdaftar", course.url)
+        }
+        val url = VClassSessionPolicy.officialUrl(course.url)
+            ?: return EnrollmentResult(false, message = "URL kelas tidak valid.")
+        if (url.encodedPath != "/course/view.php" || url.queryParameter("id") != course.id) {
+            return EnrollmentResult(false, message = "ID kelas tidak sesuai dengan URL VClass.")
+        }
+        val page = getAuthenticatedPage(url.toString())
+        if (!page.success) return EnrollmentResult(false, message = page.message)
+        return EnrollmentParser.parse(page.html, page.finalUrl, course.id)
+    }
+
+    internal fun enrollInCourse(course: VClassCourse, enrollmentKey: String): EnrollmentResult {
+        synchronized(enrollingCourseIds) {
+            if (!enrollingCourseIds.add(course.id)) return EnrollmentResult(false, message = "Pendaftaran kelas sedang diproses.")
+        }
+        val version = generation.get()
+        return try {
+            val inspection = inspectEnrollment(course)
+            if (!inspection.success || inspection.state == EnrollmentState.ALREADY_ENROLLED) return inspection
+            val form = inspection.form ?: return inspection.copy(success = false)
+            if (form.keyField != null && enrollmentKey.isBlank()) {
+                return inspection.copy(success = false, message = "Masukkan kunci pendaftaran dari dosen.")
+            }
+            val body = FormBody.Builder()
+            form.fields.forEach { (name, value) -> body.add(name, value) }
+            form.keyField?.let { body.add(it, enrollmentKey) }
+            if (!isSessionCurrent(version)) return EnrollmentResult(false, message = "Sesi VClass telah berubah. Masuk kembali.")
+            val error = client.newCall(Request.Builder().url(form.action).header("Referer", inspection.officialUrl)
+                .post(body.build()).build()).execute().use { response ->
+                val html = response.body?.string().orEmpty()
+                if (!response.isSuccessful) return EnrollmentResult(false, message = "VClass mengembalikan HTTP ${response.code}.")
+                if (!VClassSessionPolicy.authenticated(response.request.url.toString(), html)) throw SessionExpiredException()
+                Jsoup.parse(html).select(".ferror, .invalid-feedback, .alert-danger, .errormessage").text()
+            }
+            val verified = getMyCourses()
+            if (verified.success && verified.courses.any { it.id == course.id } && isSessionCurrent(version)) {
+                EnrollmentResult(true, EnrollmentState.ALREADY_ENROLLED, "Kelas berhasil ditambahkan dan terverifikasi di Kelas saya.", course.url)
+            } else EnrollmentResult(false, inspection.state,
+                if (!verified.success) verified.message else error.ifBlank { "VClass belum mengonfirmasi pendaftaran. Periksa kunci atau gunakan halaman resmi." },
+                inspection.officialUrl)
+        } catch (_: SessionExpiredException) {
+            synchronized(this) { if (version == generation.get()) clearSession() }
+            EnrollmentResult(false, message = "Sesi VClass berakhir. Masuk kembali dengan Microsoft.")
+        } catch (_: Exception) {
+            EnrollmentResult(false, message = "Pendaftaran belum dapat diverifikasi. Periksa Kelas saya sebelum mencoba kembali.")
+        } finally { synchronized(enrollingCourseIds) { enrollingCourseIds.remove(course.id) } }
     }
 
     fun getDeadlines(): DeadlinesResult {
+        val version = generation.get()
         return try {
             val myPage =
                 getAuthenticatedPage(
@@ -461,7 +413,8 @@ object VClassClient {
             if (!myPage.success) {
                 return DeadlinesResult(
                     success = false,
-                    message = myPage.message
+                    message = myPage.message,
+                    sessionExpired = myPage.sessionExpired
                 )
             }
 
@@ -476,7 +429,8 @@ object VClassClient {
                         sesskey
                     )
 
-                if (ajaxDeadlines.isNotEmpty()) {
+                if (!isSessionCurrent(version)) throw SessionExpiredException()
+                if (ajaxDeadlines != null) {
                     return DeadlinesResult(
                         success = true,
                         deadlines = ajaxDeadlines,
@@ -493,7 +447,8 @@ object VClassClient {
             if (!upcomingPage.success) {
                 return DeadlinesResult(
                     success = false,
-                    message = upcomingPage.message
+                    message = upcomingPage.message,
+                    sessionExpired = upcomingPage.sessionExpired
                 )
             }
 
@@ -502,6 +457,13 @@ object VClassClient {
                     upcomingPage.html
                 )
 
+            if (!isSessionCurrent(version)) throw SessionExpiredException()
+            val calendarText = Jsoup.parse(upcomingPage.html).select("#region-main, [role=main]").text().lowercase()
+            val noEvents = "no upcoming events" in calendarText || "no events" in calendarText ||
+                "tidak ada" in calendarText || "tidak ditemukan" in calendarText
+            if (htmlDeadlines.isEmpty() && !noEvents) {
+                return DeadlinesResult(false, message = "Format deadline VClass belum dapat dibaca. Coba muat ulang tugas.")
+            }
             DeadlinesResult(
                 success = true,
                 deadlines = htmlDeadlines,
@@ -512,350 +474,94 @@ object VClassClient {
                         "Tidak ada deadline aktif saat ini."
                     }
             )
-        } catch (e: Exception) {
+        } catch (_: SessionExpiredException) {
+            synchronized(this) { if (version == generation.get()) clearSession() }
+            return DeadlinesResult(false, message = "Sesi VClass berakhir. Masuk kembali dengan Microsoft.", sessionExpired = true)
+        } catch (_: Exception) {
             DeadlinesResult(
                 success = false,
-                message =
-                    e.message
-                        ?: "Gagal mengambil deadline VClass."
+                message = "Tidak dapat menghubungi VClass. Periksa koneksi dan coba lagi."
             )
         }
     }
 
-    private fun getDeadlinesViaAjax(
-        sesskey: String
-    ): List<VClassDeadline> {
-        return try {
-            val now =
-                Instant.now()
-                    .epochSecond
-
-            val until =
-                now +
-                    (
-                        120L *
-                            24L *
-                            60L *
-                            60L
-                        )
-
-            val args =
-                JSONObject()
-                    .put(
-                        "timesortfrom",
-                        now
-                    )
-                    .put(
-                        "timesortto",
-                        until
-                    )
-                    .put(
-                        "limitnum",
-                        50
-                    )
-                    .put(
-                        "limittononsuspendedevents",
-                        true
-                    )
-
-            val requestItem =
-                JSONObject()
-                    .put(
-                        "index",
-                        0
-                    )
-                    .put(
-                        "methodname",
-                        "core_calendar_get_action_events_by_timesort"
-                    )
-                    .put(
-                        "args",
-                        args
-                    )
-
-            val payload =
-                JSONArray()
-                    .put(
-                        requestItem
-                    )
-                    .toString()
-
-            val body =
-                payload.toRequestBody(
-                    "application/json; charset=utf-8"
-                        .toMediaType()
-                )
-
-            val url =
-                "$AJAX_URL?sesskey=$sesskey&info=core_calendar_get_action_events_by_timesort"
-
-            val request =
-                Request.Builder()
-                    .url(url)
-                    .header(
-                        "Accept",
-                        "application/json, text/javascript, */*; q=0.01"
-                    )
-                    .header(
-                        "X-Requested-With",
-                        "XMLHttpRequest"
-                    )
-                    .header(
-                        "Referer",
-                        MY_COURSES_URL
-                    )
-                    .post(body)
-                    .build()
-
-            val responseText =
-                client
-                    .newCall(
-                        request
-                    )
-                    .execute()
-                    .use { response ->
-
-                        if (!response.isSuccessful) {
-                            return emptyList()
-                        }
-
-                        response.body
-                            ?.string()
-                            .orEmpty()
-                    }
-
-            if (responseText.isBlank()) {
-                return emptyList()
-            }
-
-            val responseArray =
-                JSONArray(
-                    responseText
-                )
-
-            if (responseArray.length() == 0) {
-                return emptyList()
-            }
-
-            val responseItem =
-                responseArray
-                    .optJSONObject(
-                        0
-                    )
-                    ?: return emptyList()
-
-            if (
-                responseItem.optBoolean(
-                    "error",
-                    false
-                )
-            ) {
-                return emptyList()
-            }
-
-            val data =
-                responseItem
-                    .optJSONObject(
-                        "data"
-                    )
-                    ?: return emptyList()
-
-            val events =
-                data.optJSONArray(
-                    "events"
-                )
-                    ?: return emptyList()
-
-            val deadlines =
-                mutableListOf<VClassDeadline>()
-
-            for (
-                index in 0 until events.length()
-            ) {
-                val event =
-                    events
-                        .optJSONObject(
-                            index
-                        )
-                        ?: continue
-
-                val action =
-                    event.optJSONObject(
-                        "action"
-                    )
-
-                val courseInfo =
-                    event.optJSONObject(
-                        "course"
-                    )
-
-                val title =
-                    event
-                        .optString(
-                            "name"
-                        )
-                        .ifBlank {
-                            action
-                                ?.optString(
-                                    "name"
-                                )
-                                .orEmpty()
-                        }
-                        .ifBlank {
-                            "Tugas VClass"
-                        }
-
-                val url =
-                    action
-                        ?.optString(
-                            "url"
-                        )
-                        .orEmpty()
-                        .ifBlank {
-                            event.optString(
-                                "url"
-                            )
-                        }
-                        .ifBlank {
-                            UPCOMING_URL
-                        }
-
-                val rawCourse =
-                    courseInfo
-                        ?.optString(
-                            "fullnamedisplay"
-                        )
-                        .orEmpty()
-                        .ifBlank {
-                            courseInfo
-                                ?.optString(
-                                    "fullname"
-                                )
-                                .orEmpty()
-                        }
-                        .ifBlank {
-                            "Mata Kuliah Umum"
-                        }
-
-                val parsedCourse =
-                    parseCourseParts(
-                        rawCourse
-                    )
-
-                val courseId =
-                    courseInfo
-                        ?.optString(
-                            "id"
-                        )
-                        .orEmpty()
-
-                val timestamp =
-                    if (
-                        event.has(
-                            "timesort"
-                        ) &&
-                        !event.isNull(
-                            "timesort"
-                        )
-                    ) {
-                        event.optLong(
-                            "timesort",
-                            0L
-                        )
-                    } else {
-                        event.optLong(
-                            "timestart",
-                            0L
-                        )
-                    }
-
-                if (timestamp <= 0L) {
-                    continue
+    private fun getDeadlinesViaAjax(sesskey: String): List<VClassDeadline>? {
+        val now = Instant.now().epochSecond
+        val until = now + 120L * 86400L
+        val deadlines = mutableListOf<VClassDeadline>()
+        var cursor = 0L
+        repeat(20) {
+            val args = JSONObject().put("timesortfrom", now).put("timesortto", until)
+                .put("limitnum", 50).put("aftereventid", cursor).put("limittononsuspendedevents", true)
+            val payload = JSONArray().put(JSONObject().put("index", 0)
+                .put("methodname", "core_calendar_get_action_events_by_timesort").put("args", args)).toString()
+            val url = AJAX_URL.toHttpUrl().newBuilder().addQueryParameter("sesskey", sesskey)
+                .addQueryParameter("info", "core_calendar_get_action_events_by_timesort").build()
+            val text = client.newCall(Request.Builder().url(url).header("Referer", MY_COURSES_URL)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType())).build())
+                .execute().use { response ->
+                    if (response.code == 401 || response.code == 403) throw SessionExpiredException()
+                    if (!response.isSuccessful) return null
+                    response.body?.string().orEmpty()
                 }
-
-                val deadlineInfo =
-                    createDeadlineTimeInfo(
-                        timestamp
-                    )
-
-                if (
-                    deadlineInfo.urgency ==
-                    "expired"
-                ) {
-                    continue
-                }
-
-                val eventType =
-                    event
-                        .optString(
-                            "eventtype"
-                        )
-                        .ifBlank {
-                            event.optString(
-                                "modulename"
-                            )
-                        }
-
-                val type =
-                    classifyActivityType(
-                        url = url,
-                        title = title,
-                        eventType = eventType
-                    )
-
-                val eventId =
-                    event
-                        .optString(
-                            "id"
-                        )
-                        .ifBlank {
-                            (index + 1)
-                                .toString()
-                        }
-
-                deadlines.add(
-                    VClassDeadline(
-                        id =
-                            "task-vclass-$eventId",
-                        title =
-                            title,
-                        courseName =
-                            parsedCourse.name,
-                        courseCode =
-                            parsedCourse.code,
-                        courseId =
-                            courseId,
-                        semester =
-                            parsedCourse.semester,
-                        type =
-                            type,
-                        deadlineTimestamp =
-                            timestamp,
-                        deadlineIso =
-                            deadlineInfo.iso,
-                        deadlineDisplay =
-                            deadlineInfo.display,
-                        timeLeft =
-                            deadlineInfo.timeLeft,
-                        urgency =
-                            deadlineInfo.urgency,
-                        url =
-                            normalizeUrl(
-                                url
-                            )
-                    )
-                )
+            val item = try { JSONArray(text).optJSONObject(0) } catch (_: Exception) { return null } ?: return null
+            if (item.optBoolean("error", false)) {
+                val code = item.optJSONObject("exception")?.optString("errorcode").orEmpty()
+                if (code in setOf("requireloginerror", "invalidsesskey", "servicerequireslogin")) throw SessionExpiredException()
+                return null
             }
-
-            deadlines.sortedBy {
-                it.deadlineTimestamp
-            }
-        } catch (_: Exception) {
-            emptyList()
+            val data = item.optJSONObject("data") ?: return null
+            val events = data.optJSONArray("events") ?: return null
+            deadlines += parseDeadlineEvents(events, now)
+            if (events.length() < 50) return deadlines.distinctBy { it.id }.sortedBy { it.deadlineTimestamp }
+            val next = data.optLong("lastid", events.optJSONObject(events.length() - 1)?.optLong("id", 0L) ?: 0L)
+            if (next == 0L || next == cursor) throw java.io.IOException("VClass calendar pagination did not advance")
+            cursor = next
         }
+        throw java.io.IOException("VClass calendar pagination limit exceeded")
     }
 
-    private fun getDeadlinesViaHtml(
+    internal fun parseDeadlineEvents(events: JSONArray, nowSeconds: Long = Instant.now().epochSecond): List<VClassDeadline> {
+        val deadlines = mutableListOf<VClassDeadline>()
+        for (index in 0 until events.length()) {
+            val event = events.optJSONObject(index) ?: continue
+            val action = event.optJSONObject("action")
+            val course = event.optJSONObject("course")
+            val rawTitle = event.optString("name").ifBlank { action?.optString("name").orEmpty() }
+            val title = Jsoup.parse(rawTitle).text().trim().ifBlank { "Aktivitas VClass" }
+            val rawUrl = action?.optString("url").orEmpty().ifBlank { event.optString("url") }.ifBlank { UPCOMING_URL }
+            val url = VClassSessionPolicy.officialUrl(rawUrl)?.toString() ?: continue
+            val rawCourse = course?.optString("fullnamedisplay").orEmpty()
+                .ifBlank { course?.optString("fullname").orEmpty() }.ifBlank { "Mata Kuliah Umum" }
+            val parsedCourse = parseCourseParts(rawCourse)
+            val timestamp = event.optLong("timesort", 0L).takeIf { it > 0L } ?: event.optLong("timestart", 0L)
+            if (timestamp <= nowSeconds || timestamp > 253402300799L) continue
+            val time = createDeadlineTimeInfo(timestamp)
+            if (time.urgency == "expired") continue
+            val type = classifyActivityType(url, title, event.optString("eventtype").ifBlank { event.optString("modulename") })
+            deadlines.add(VClassDeadline(
+                id = deadlineId(url, timestamp), title = title,
+                courseName = parsedCourse.name, courseCode = parsedCourse.code,
+                courseId = course?.optString("id").orEmpty(), semester = parsedCourse.semester,
+                type = type, deadlineTimestamp = timestamp, deadlineIso = time.iso,
+                deadlineDisplay = time.display, timeLeft = time.timeLeft, urgency = time.urgency, url = url
+            ))
+        }
+        return deadlines.distinctBy { it.id }.sortedBy { it.deadlineTimestamp }
+    }
+
+    internal fun deadlineId(url: String, timestamp: Long): String {
+        val parsed = VClassSessionPolicy.officialUrl(url)
+        val identity = if (parsed?.encodedPath?.startsWith("/mod/") == true) {
+            parsed.newBuilder().query(null).addQueryParameter("id", parsed.queryParameter("id").orEmpty()).build().toString()
+        } else url
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest("$identity|$timestamp".toByteArray(Charsets.UTF_8))
+        return "task-vclass-" + digest.take(12).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    internal fun getDeadlinesViaHtml(
         html: String
     ): List<VClassDeadline> {
         val document =
@@ -867,8 +573,7 @@ object VClassClient {
         val deadlines =
             mutableListOf<VClassDeadline>()
 
-        val seenUrls =
-            mutableSetOf<String>()
+        val seenIds = mutableSetOf<String>()
 
         val eventNodes =
             document.select(
@@ -895,12 +600,7 @@ object VClassClient {
                         )
                     }
 
-            if (
-                url.isBlank() ||
-                url in seenUrls
-            ) {
-                continue
-            }
+            if (VClassSessionPolicy.officialUrl(url) == null) continue
 
             val title =
                 activityLink
@@ -929,7 +629,7 @@ object VClassClient {
             val courseLink =
                 courseNode
                     ?.selectFirst(
-                        "a[href*='course/view.php?id=']"
+                        "a[href*='course/view.php']"
                     )
 
             val courseId =
@@ -952,11 +652,14 @@ object VClassClient {
                     ?.trim()
                     .orEmpty()
 
-            val timestamp =
-                parseMoodleDate(
-                    rawDate
-                )
-                    ?: continue
+            val timeNode = node.selectFirst("time[datetime], [data-timestamp], [data-time]")
+            val timeValue = timeNode?.attr("datetime").orEmpty().ifBlank {
+                timeNode?.attr("data-timestamp").orEmpty().ifBlank { timeNode?.attr("data-time").orEmpty() }
+            }
+            val timestamp = timeValue.toLongOrNull() ?: parseMoodleDate(timeValue) ?: parseMoodleDate(rawDate) ?: continue
+            if (timestamp <= 0L || timestamp > 253402300799L) continue
+            val id = deadlineId(normalizeUrl(url), timestamp)
+            if (!seenIds.add(id)) continue
 
             val info =
                 createDeadlineTimeInfo(
@@ -970,14 +673,10 @@ object VClassClient {
                 continue
             }
 
-            seenUrls.add(
-                url
-            )
-
             deadlines.add(
                 VClassDeadline(
                     id =
-                        "task-html-${deadlines.size + 1}",
+                        id,
                     title =
                         title,
                     courseName =
@@ -1020,8 +719,9 @@ object VClassClient {
         }
     }
 
-    private fun createDeadlineTimeInfo(
-        timestamp: Long
+    internal fun createDeadlineTimeInfo(
+        timestamp: Long,
+        nowTimestamp: Long = Instant.now().epochSecond
     ): DeadlineTimeInfo {
         val deadline =
             Instant
@@ -1032,10 +732,7 @@ object VClassClient {
                     wibZone
                 )
 
-        val now =
-            ZonedDateTime.now(
-                wibZone
-            )
+        val now = Instant.ofEpochSecond(nowTimestamp).atZone(wibZone)
 
         val seconds =
             deadline.toEpochSecond() -
@@ -1044,10 +741,7 @@ object VClassClient {
         val formatter =
             DateTimeFormatter.ofPattern(
                 "dd MMM yyyy, HH:mm 'WIB'",
-                Locale(
-                    "id",
-                    "ID"
-                )
+                Locale.forLanguageTag("id-ID")
             )
 
         val display =
@@ -1155,15 +849,22 @@ object VClassClient {
         )
     }
 
-    private fun parseMoodleDate(
+    internal fun parseMoodleDate(
         rawValue: String
     ): Long? {
         if (rawValue.isBlank()) {
             return null
         }
 
-        var value =
-            rawValue.trim()
+        val raw = rawValue.trim()
+        runCatching { java.time.OffsetDateTime.parse(raw).toEpochSecond() }.getOrNull()?.let { return it }
+        runCatching { Instant.parse(raw).epochSecond }.getOrNull()?.let { return it }
+        val zone = when {
+            Regex("\\bWITA\\b", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> ZoneId.of("Asia/Makassar")
+            Regex("\\bWIT\\b", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> ZoneId.of("Asia/Jayapura")
+            else -> wibZone
+        }
+        var value = raw
 
         val replacements =
             mapOf(
@@ -1229,11 +930,8 @@ object VClassClient {
             pattern in patterns
         ) {
             try {
-                val formatter =
-                    DateTimeFormatter.ofPattern(
-                        pattern,
-                        Locale.ENGLISH
-                    )
+                val formatter = java.time.format.DateTimeFormatterBuilder().parseCaseInsensitive()
+                    .appendPattern(pattern).toFormatter(Locale.ENGLISH)
 
                 val local =
                     LocalDateTime.parse(
@@ -1243,7 +941,7 @@ object VClassClient {
 
                 return local
                     .atZone(
-                        wibZone
+                        zone
                     )
                     .toEpochSecond()
             } catch (_: Exception) {
@@ -1253,42 +951,27 @@ object VClassClient {
         return null
     }
 
-    private fun classifyActivityType(
-        url: String,
-        title: String,
-        eventType: String
-    ): String {
-        val text =
-            "$url $title $eventType"
-                .lowercase()
-
+    private fun classifyActivityType(url: String, title: String, eventType: String): String {
+        val path = VClassSessionPolicy.officialUrl(url)?.encodedPath.orEmpty()
         return when {
-            "/mod/quiz/" in text ||
-                "quiz" in text ||
-                "kuis" in text ->
-
-                "Kuis"
-
-            "/mod/forum/" in text ||
-                "forum" in text ||
-                "diskusi" in text ->
-
-                "Forum"
-
-            "/mod/assign/" in text ||
-                "assignment" in text ||
-                "tugas" in text ->
-
-                "Tugas"
-
-            else ->
-                "Materi"
+            path.startsWith("/mod/quiz/") -> "Kuis"
+            path.startsWith("/mod/forum/") -> "Forum"
+            path.startsWith("/mod/assign/") -> "Tugas"
+            else -> {
+                val text = "$title $eventType".lowercase()
+                when {
+                    "quiz" in text || "kuis" in text -> "Kuis"
+                    "forum" in text || "diskusi" in text -> "Forum"
+                    "assign" in text || "tugas" in text -> "Tugas"
+                    else -> "Materi"
+                }
+            }
         }
     }
 
     private fun getCoursesViaAjax(
         sesskey: String
-    ): List<VClassCourse> {
+    ): List<VClassCourse>? {
         val classifications =
             listOf(
                 "all",
@@ -1297,8 +980,8 @@ object VClassClient {
                 "past"
             )
 
-        val courses =
-            mutableListOf<VClassCourse>()
+        val courses = mutableListOf<VClassCourse>()
+        var validFallbackReplies = 0
 
         val seenIds =
             mutableSetOf<String>()
@@ -1393,6 +1076,7 @@ object VClassClient {
                         .execute()
                         .use { response ->
 
+                            if (response.code == 401 || response.code == 403) throw SessionExpiredException()
                             if (!response.isSuccessful) {
                                 ""
                             } else {
@@ -1424,12 +1108,9 @@ object VClassClient {
                         )
                         ?: continue
 
-                if (
-                    responseItem.optBoolean(
-                        "error",
-                        false
-                    )
-                ) {
+                if (responseItem.optBoolean("error", false)) {
+                    val errorCode = responseItem.optJSONObject("exception")?.optString("errorcode").orEmpty()
+                    if (errorCode in setOf("requireloginerror", "invalidsesskey", "servicerequireslogin")) throw SessionExpiredException()
                     continue
                 }
 
@@ -1446,6 +1127,7 @@ object VClassClient {
                     )
                         ?: continue
 
+                if (classification != "all") validFallbackReplies++
                 for (
                     index in 0 until rawCourses.length()
                 ) {
@@ -1464,7 +1146,7 @@ object VClassClient {
                             .trim()
 
                     if (
-                        courseId.isBlank() ||
+                        courseId.toLongOrNull()?.let { it > 1 } != true ||
                         courseId in seenIds
                     ) {
                         continue
@@ -1509,20 +1191,17 @@ object VClassClient {
                     )
                 }
 
-                if (
-                    classification == "all" &&
-                    courses.isNotEmpty()
-                ) {
-                    break
-                }
+                if (classification == "all") return courses
+            } catch (e: SessionExpiredException) {
+                throw e
             } catch (_: Exception) {
             }
         }
 
-        return courses
+        return courses.takeIf { validFallbackReplies == 3 }
     }
 
-    private fun getCoursesViaHtml(
+    internal fun getCoursesViaHtml(
         html: String
     ): List<VClassCourse> {
         val document =
@@ -1553,7 +1232,7 @@ object VClassClient {
 
             val link =
                 card.selectFirst(
-                    "a.coursename[href], a[href*='course/view.php?id=']"
+                    "a.coursename[href], a[href*='course/view.php']"
                 )
 
             if (courseId.isBlank()) {
@@ -1616,7 +1295,7 @@ object VClassClient {
 
         val links =
             document.select(
-                "a[href*='course/view.php?id=']"
+                "[data-region=course-content] a[href*='course/view.php'], .block_myoverview a[href*='course/view.php'], #mycourses a[href*='course/view.php']"
             )
 
         for (
@@ -1670,7 +1349,7 @@ object VClassClient {
         return courses
     }
 
-    private fun parseSearchCourses(
+    internal fun parseSearchCourses(
         html: String
     ): List<VClassCourse> {
         val document =
@@ -1687,7 +1366,7 @@ object VClassClient {
 
         val courseBoxes =
             document.select(
-                ".coursebox, .course-search-result, [data-courseid]"
+                ".coursebox, .course-search-result, [data-courseid], [data-course-id]"
             )
 
         for (
@@ -1738,11 +1417,11 @@ object VClassClient {
                 normalizeCourse(
                     courseId = courseId,
                     rawName = rawName,
-                    url =
-                        normalizeUrl(
-                            href
-                        )
-                )
+                    url = normalizeUrl(href)
+                ).let { course ->
+                    val instructor = box.select(".teachers a, .instructors a, [data-region=teacher]").text().trim()
+                    if (instructor.isNotBlank()) course.copy(instructor = instructor) else course
+                }
             )
         }
 
@@ -1752,7 +1431,7 @@ object VClassClient {
 
         val links =
             document.select(
-                "a[href*='course/view.php?id=']"
+                "a[href*='course/view.php']"
             )
 
         for (
@@ -1819,10 +1498,10 @@ object VClassClient {
     ): Element? {
         val selectors =
             listOf(
-                ".coursename a[href*='course/view.php?id=']",
-                "h3 a[href*='course/view.php?id=']",
-                "h4 a[href*='course/view.php?id=']",
-                "a[href*='course/view.php?id=']"
+                ".coursename a[href*='course/view.php']",
+                "h3 a[href*='course/view.php']",
+                "h4 a[href*='course/view.php']",
+                "a[href*='course/view.php']"
             )
 
         for (
@@ -1841,7 +1520,7 @@ object VClassClient {
         return null
     }
 
-    private fun normalizeCourse(
+    internal fun normalizeCourse(
         courseId: String,
         rawName: String,
         url: String
@@ -1862,115 +1541,33 @@ object VClassClient {
                     url
                 ),
             rawFullName =
-                parsed.rawFullName
+                parsed.rawFullName,
+            className = parsed.className
         )
     }
 
-    private fun parseCourseParts(
-        rawName: String
-    ): ParsedCourse {
-        val cleanRawName =
-            Jsoup.parse(
-                rawName
-            )
-                .text()
-                .replace(
-                    Regex("\\s+"),
-                    " "
-                )
-                .trim()
-
-        val parts =
-            cleanRawName
-                .split(
-                    "|"
-                )
-                .map {
-                    it.trim()
-                }
-                .filter {
-                    it.isNotBlank()
-                }
-
-        val semesterRegex =
-            Regex(
-                "^[A-Za-z]+\\s*\\d{4}/\\d{4}$"
-            )
-
+    private fun parseCourseParts(rawName: String): ParsedCourse {
+        val clean = Jsoup.parse(rawName).text().replace(Regex("\\s+"), " ").trim()
+        val parts = clean.split("|").map { it.trim() }.filter { it.isNotBlank() }
+        val semesterPattern = Regex("^[A-Za-z]+\\s*\\d{4}\\s*/\\s*\\d{4}$")
+        val classPattern = Regex("\\b[1-9][A-Z]{2}\\d{2}\\b", RegexOption.IGNORE_CASE)
+        val className = classPattern.find(clean)?.value.orEmpty().uppercase()
         var semester = ""
         var code = ""
-        var name = cleanRawName
+        var name = clean
         var instructor = ""
-
-        if (
-            parts.size >= 4 &&
-            semesterRegex.matches(
-                parts[0]
-            )
-        ) {
-            semester =
-                parts[0]
-
-            code =
-                parts[1]
-
-            name =
-                parts
-                    .subList(
-                        2,
-                        parts.size - 1
-                    )
-                    .joinToString(
-                        " | "
-                    )
-
-            instructor =
-                parts.last()
-        } else if (
-            parts.size >= 3 &&
-            semesterRegex.matches(
-                parts[0]
-            )
-        ) {
-            semester =
-                parts[0]
-
-            code =
-                parts[1]
-
-            name =
-                parts
-                    .drop(
-                        2
-                    )
-                    .joinToString(
-                        " | "
-                    )
-        } else if (
-            parts.size == 2
-        ) {
-            code =
-                parts[0]
-
-            name =
-                parts[1]
+        if (parts.size >= 3 && semesterPattern.matches(parts[0])) {
+            semester = parts[0]
+            code = parts[1]
+            val titleParts = parts.drop(2).toMutableList()
+            if (titleParts.size >= 2 && !classPattern.matches(titleParts.last())) instructor = titleParts.removeAt(titleParts.lastIndex)
+            name = titleParts.filterNot { classPattern.matches(it) }.joinToString(" | ")
+        } else if (parts.size == 2 && Regex("[A-Za-z0-9_-]{3,}").matches(parts[0])) {
+            code = parts[0]
+            name = parts[1]
         }
-
-        name =
-            name
-                .replace(
-                    Regex("\\s*\\*\\s*$"),
-                    ""
-                )
-                .trim()
-
-        return ParsedCourse(
-            name = name,
-            code = code,
-            semester = semester,
-            instructor = instructor,
-            rawFullName = cleanRawName
-        )
+        name = name.replace(Regex("\\s*\\*\\s*$"), "").trim().ifBlank { clean }
+        return ParsedCourse(name, code, semester, instructor, clean, className)
     }
 
     private fun extractCourseName(
@@ -1981,7 +1578,7 @@ object VClassClient {
 
         cloned
             .select(
-                ".sr-only, .accesshide"
+                ".sr-only, .accesshide, .visually-hidden"
             )
             .remove()
 
@@ -2051,20 +1648,10 @@ object VClassClient {
         return ""
     }
 
-    private fun extractCourseId(
-        url: String
-    ): String {
-        return Regex(
-            "[?&]id=(\\d+)"
-        )
-            .find(
-                url
-            )
-            ?.groupValues
-            ?.getOrNull(
-                1
-            )
-            .orEmpty()
+    internal fun extractCourseId(url: String): String {
+        val official = VClassSessionPolicy.officialUrl(url) ?: return ""
+        if (official.encodedPath != "/course/view.php") return ""
+        return official.queryParameter("id")?.takeIf { it.toLongOrNull()?.let { id -> id > 1 } == true }.orEmpty()
     }
 
     private fun extractDisplayName(
@@ -2098,116 +1685,61 @@ object VClassClient {
         return ""
     }
 
-    private fun normalizeUrl(
-        url: String
-    ): String {
-        return when {
-            url.startsWith(
-                "https://"
-            ) ->
-                url
+    private fun normalizeUrl(url: String): String =
+        VClassSessionPolicy.officialUrl(url)?.toString().orEmpty()
 
-            url.startsWith(
-                "http://"
-            ) ->
-                url
-
-            url.startsWith(
-                "/"
-            ) ->
-                "$BASE_URL$url"
-
-            url.isBlank() ->
-                ""
-
-            else ->
-                "$BASE_URL/$url"
-        }
-    }
-
-    private fun getAuthenticatedPage(
-        url: String
-    ): PageResult {
+    private fun getAuthenticatedPage(url: String): PageResult {
+        val version = generation.get()
         return try {
-            val request =
-                Request.Builder()
-                    .url(url)
-                    .get()
-                    .build()
-
-            client
-                .newCall(
-                    request
-                )
-                .execute()
-                .use { response ->
-
-                    if (!response.isSuccessful) {
-                        return PageResult(
-                            success = false,
-                            message = "VClass mengembalikan HTTP ${response.code}."
-                        )
-                    }
-
-                    val html =
-                        response.body
-                            ?.string()
-                            .orEmpty()
-
-                    val finalUrl =
-                        response.request
-                            .url
-                            .toString()
-
-                    if (
-                        finalUrl.contains(
-                            "login/index.php"
-                        )
-                    ) {
-                        return PageResult(
-                            success = false,
-                            message = "Session VClass sudah berakhir."
-                        )
-                    }
-
-                    PageResult(
-                        success = true,
-                        html = html
-                    )
+            val official = VClassSessionPolicy.officialUrl(url)
+                ?: return PageResult(false, message = "URL VClass tidak valid.")
+            client.newCall(Request.Builder().url(official).get().build()).execute().use { response ->
+                val html = response.body?.string().orEmpty()
+                if (response.code == 401 || response.code == 403 && VClassSessionPolicy.isAuthPath(response.request.url.encodedPath)) {
+                    throw SessionExpiredException()
                 }
-        } catch (e: Exception) {
-            PageResult(
-                success = false,
-                message =
-                    e.message
-                        ?: "Gagal menghubungi VClass."
-            )
+                if (!response.isSuccessful) return PageResult(false, message = "VClass mengembalikan HTTP ${response.code}.")
+                if (!VClassSessionPolicy.authenticated(response.request.url.toString(), html)) throw SessionExpiredException()
+                if (!isSessionCurrent(version)) throw SessionExpiredException()
+                PageResult(true, html = html, finalUrl = response.request.url.toString())
+            }
+        } catch (_: SessionExpiredException) {
+            synchronized(this) { if (version == generation.get()) clearSession() }
+            PageResult(false, message = "Sesi VClass berakhir. Masuk kembali dengan Microsoft.", sessionExpired = true)
+        } catch (_: Exception) {
+            PageResult(false, message = "Tidak dapat menghubungi VClass. Periksa koneksi dan coba lagi.")
         }
     }
+
 }
 
 data class LoginResult(
     val success: Boolean,
     val message: String,
-    val displayName: String = ""
+    val displayName: String = "",
+    val sessionExpired: Boolean = false
 )
 
 data class CoursesResult(
     val success: Boolean,
     val courses: List<VClassCourse> = emptyList(),
-    val message: String = ""
+    val message: String = "",
+    val sessionExpired: Boolean = false
 )
 
 data class SearchCoursesResult(
     val success: Boolean,
     val courses: List<VClassCourse> = emptyList(),
-    val message: String = ""
+    val message: String = "",
+    val sessionExpired: Boolean = false,
+    val nextPage: Int? = null
 )
 
 data class DeadlinesResult(
     val success: Boolean,
     val deadlines: List<VClassDeadline> = emptyList(),
-    val message: String = ""
+    val message: String = "",
+    val sessionExpired: Boolean = false
 )
 
 data class VClassCourse(
@@ -2217,7 +1749,8 @@ data class VClassCourse(
     val semester: String,
     val instructor: String,
     val url: String,
-    val rawFullName: String
+    val rawFullName: String,
+    val className: String = ""
 )
 
 data class VClassDeadline(
@@ -2241,10 +1774,11 @@ private data class ParsedCourse(
     val code: String,
     val semester: String,
     val instructor: String,
-    val rawFullName: String
+    val rawFullName: String,
+    val className: String = ""
 )
 
-private data class DeadlineTimeInfo(
+internal data class DeadlineTimeInfo(
     val iso: String,
     val display: String,
     val timeLeft: String,
@@ -2253,101 +1787,11 @@ private data class DeadlineTimeInfo(
 
 private data class PageResult(
     val success: Boolean,
+    val finalUrl: String = "",
     val html: String = "",
-    val message: String = ""
+    val message: String = "",
+    val sessionExpired: Boolean = false
 )
 
-private class MemoryCookieJar :
-    CookieJar {
 
-    private val cookies =
-        mutableListOf<Cookie>()
-
-    override fun saveFromResponse(
-        url: HttpUrl,
-        cookies: List<Cookie>
-    ) {
-        synchronized(
-            this.cookies
-        ) {
-            this.cookies.removeAll {
-                    oldCookie ->
-
-                cookies.any {
-                        newCookie ->
-
-                    oldCookie.name ==
-                        newCookie.name &&
-                        oldCookie.domain ==
-                        newCookie.domain &&
-                        oldCookie.path ==
-                        newCookie.path
-                }
-            }
-
-            this.cookies.addAll(
-                cookies
-            )
-        }
-    }
-
-    override fun loadForRequest(
-        url: HttpUrl
-    ): List<Cookie> {
-        synchronized(
-            cookies
-        ) {
-            val currentTime =
-                System.currentTimeMillis()
-
-            cookies.removeAll {
-                it.expiresAt <
-                    currentTime
-            }
-
-            return cookies.filter {
-                it.matches(
-                    url
-                )
-            }
-        }
-    }
-
-    fun replaceAll(
-        newCookies: List<Cookie>
-    ) {
-        synchronized(
-            cookies
-        ) {
-            cookies.clear()
-
-            cookies.addAll(
-                newCookies
-            )
-        }
-    }
-
-    fun getAll(): List<Cookie> {
-        synchronized(
-            cookies
-        ) {
-            val currentTime =
-                System.currentTimeMillis()
-
-            cookies.removeAll {
-                it.expiresAt <
-                    currentTime
-            }
-
-            return cookies.toList()
-        }
-    }
-
-    fun clear() {
-        synchronized(
-            cookies
-        ) {
-            cookies.clear()
-        }
-    }
-}
+private data class SessionVersion(val value: Long)
