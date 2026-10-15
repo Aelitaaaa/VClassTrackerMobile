@@ -15,6 +15,12 @@ captures/
 keystore.properties
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.age
+signing-credentials.json
+backup-identity.txt
+__pycache__/
 
 .env
 .env.*
