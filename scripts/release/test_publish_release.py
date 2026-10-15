@@ -22,7 +22,10 @@ class PublisherTests(unittest.TestCase):
         (self.folder / publisher.APK).write_bytes(b'public APK fixture')
         apk_hash = publisher.digest(self.folder / publisher.APK)
         (self.folder / (publisher.APK + '.sha256')).write_text(f'{apk_hash}  {publisher.APK}\n')
-        (self.folder / 'verification.json').write_text(json.dumps({'sha256': apk_hash, 'source_commit': self.commit}))
+        (self.folder / 'verification.json').write_text(json.dumps({
+            'package': 'com.dzaky.vclasstracker', 'version_name': '1.1.0', 'version_code': 2,
+            'certificate_sha256': publisher.APPROVED_CERTIFICATE,
+            'sha256': apk_hash, 'source_commit': self.commit}))
         (self.folder / 'release-notes.md').write_text(self.notes)
         self.release = None
         self.uploaded = {}
@@ -79,7 +82,10 @@ class PublisherTests(unittest.TestCase):
                     name = args[index + 1]
                     (folder / name).write_bytes(self.uploaded[name])
         elif command == ('release', 'edit'):
-            self.release['draft'] = False
+            if '--notes-file' in args:
+                self.release['body'] = Path(args[args.index('--notes-file') + 1]).read_text()
+            else:
+                self.release['draft'] = False
         else:
             raise AssertionError('Unexpected mutation: ' + repr(args))
         return ''
@@ -103,6 +109,7 @@ class PublisherTests(unittest.TestCase):
         self.assertFalse(self.release['draft'])
         self.assertEqual(set(self.uploaded), {publisher.APK, publisher.APK + '.sha256'})
         self.assertEqual(self.tag, publisher.RELEASE_COMMIT)
+        self.assertIn(publisher.UNINSTALL_NOTICE, self.release['body'])
         self.calls.clear()
         self.run_publisher()
         self.assert_no_mutations()
@@ -141,6 +148,29 @@ class PublisherTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'differs from the verified build'):
             self.run_publisher()
         self.assert_no_mutations()
+
+    def test_original_approved_draft_is_retained_when_rebuild_bytes_differ(self):
+        self.release = self.draft()
+        old_hash = publisher.digest(self.folder / publisher.APK)
+        self.release['body'] += (f'APK SHA-256: `{old_hash}`\n'
+                                 f'Signing certificate SHA-256: `{publisher.APPROVED_CERTIFICATE}`\n')
+        self.add_asset(publisher.APK)
+        self.add_asset(publisher.APK + '.sha256')
+        approved_bytes = self.uploaded[publisher.APK]
+        (self.folder / publisher.APK).write_bytes(b'a new build with different ZIP bytes')
+        current_hash = publisher.digest(self.folder / publisher.APK)
+        (self.folder / (publisher.APK + '.sha256')).write_text(f'{current_hash}  {publisher.APK}\n')
+        metadata = {'package': 'com.dzaky.vclasstracker', 'version_name': '1.1.0', 'version_code': 2,
+                    'certificate_sha256': publisher.APPROVED_CERTIFICATE,
+                    'sha256': current_hash, 'source_commit': self.commit}
+        (self.folder / 'verification.json').write_text(json.dumps(metadata))
+        with (patch.object(publisher, 'APPROVED_APK_SHA256', old_hash),
+              patch.object(publisher, 'inspect_apk', return_value={**metadata, 'sha256': old_hash}),
+              patch.dict(os.environ, {'ANDROID_HOME': str(self.folder / 'sdk')})):
+            self.run_publisher()
+        self.assertEqual((self.folder / publisher.APK).read_bytes(), approved_bytes)
+        self.assertFalse(self.release['draft'])
+        self.assertFalse(any(call[:2] in (('release', 'upload'), ('release', 'create')) for call in self.calls))
 
     def test_cli_failure_identifies_operation_and_redacts_secrets(self):
         token = 'test-token-do-not-log'

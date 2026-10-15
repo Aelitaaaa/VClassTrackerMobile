@@ -6,10 +6,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 import urllib.request
+
+from verify_apk import inspect_apk
 
 REPO = 'Aelitaaaa/VClassTrackerMobile'
 TAG = 'v1.1.0'
@@ -18,6 +21,11 @@ TITLE = 'VClass Tracker v1.1.0'
 # This tag already identifies the approved application source. Publisher repairs
 # must not move it to a later commit that only changes release tooling.
 RELEASE_COMMIT = '585cd8ba2d54c3517556e4f48274543fb37cbe01'
+APPROVED_APK_SHA256 = '7270f5a1d03df819c215329d79b0beb447a42f157430be13527d90241015a7d2'
+APPROVED_CERTIFICATE = '2cfb009b375a4696717258732a1e062d8e061793257bb263b7dc894730ad1e24'
+UNINSTALL_NOTICE = ('Users with v1.0.0 must uninstall it before installing v1.1.0 '
+                    'because the production signing certificate changed. '
+                    'Uninstalling removes local app data and the saved session.')
 PIPELINE_FILES = {'scripts/release/publish_release.py',
                   'scripts/release/test_publish_release.py'}
 
@@ -117,6 +125,39 @@ def verify_uploaded(folder, assets):
                 raise RuntimeError('Uploaded asset differs from the verified build: ' + name)
 
 
+def retain_approved_assets(folder, release, verification):
+    """Keep the owner's already verified APK when a rebuild changes ZIP bytes.
+
+    The original run uploaded both assets before its draft-by-tag lookup failed.
+    Only that explicitly approved hash/certificate may replace the local rebuild;
+    this recovery path never replaces release assets or release notes.
+    """
+    notes = release['body']
+    assets = release_assets(release, notes)
+    if (set(assets) != {APK, APK + '.sha256'}
+            or f'APK SHA-256: `{APPROVED_APK_SHA256}`' not in notes
+            or f'Signing certificate SHA-256: `{APPROVED_CERTIFICATE}`' not in notes):
+        raise RuntimeError('Existing release metadata differs; it will not be overwritten')
+    with tempfile.TemporaryDirectory(prefix='vclass-approved-download-') as temporary:
+        gh('release', 'download', TAG, '--repo', REPO, '--dir', temporary,
+           '--pattern', APK, '--pattern', APK + '.sha256',
+           operation='download the previously approved signed release assets')
+        downloaded = Path(temporary)
+        inspected = inspect_apk(downloaded / APK, Path(os.environ['ANDROID_HOME']) / 'build-tools/36.0.0')
+        if (inspected['sha256'] != APPROVED_APK_SHA256
+                or inspected['certificate_sha256'] != APPROVED_CERTIFICATE
+                or any(inspected[key] != verification[key] for key in
+                       ('package', 'version_name', 'version_code', 'certificate_sha256'))):
+            raise RuntimeError('Existing APK does not match the approved signed build')
+        checksum = (downloaded / (APK + '.sha256')).read_text().strip()
+        if checksum != f'{APPROVED_APK_SHA256}  {APK}':
+            raise RuntimeError('Existing checksum does not match the approved APK')
+        for name in assets:
+            shutil.copyfile(downloaded / name, folder / name)
+    print('Retaining the previously approved signed APK; no remote assets were replaced.', flush=True)
+    return {**verification, **inspected, 'source_commit': RELEASE_COMMIT}, checksum, notes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, required=True)
@@ -141,6 +182,8 @@ def main():
     check_release_source(commit, tag_commit())
     notes = (folder / 'release-notes.md').read_text()
     release = find_release()
+    if release is not None and release['body'].strip() != notes.strip():
+        verification, checksum, notes = retain_approved_assets(folder, release, verification)
     if release is None:
         # The remote tag is already checked. --verify-tag forbids automatic tag
         # creation; omitting --target also avoids asking GitHub to retarget it.
@@ -166,6 +209,13 @@ def main():
         raise RuntimeError('Draft release assets or tag did not match the intended release')
     verify_uploaded(folder, assets)
     if release['draft']:
+        if verification.get('certificate_sha256') == APPROVED_CERTIFICATE and UNINSTALL_NOTICE not in notes:
+            # Complete the requested installation instruction on this verified
+            # draft only. Published releases and existing assets are never edited.
+            notes = notes.rstrip() + '\n\n' + UNINSTALL_NOTICE + '\n'
+            (folder / 'release-notes.md').write_text(notes, encoding='utf-8')
+            gh('release', 'edit', TAG, '--repo', REPO, '--notes-file', str(folder / 'release-notes.md'),
+               operation='complete the approved draft installation instruction')
         gh('release', 'edit', TAG, '--repo', REPO, '--draft=false', '--latest',
            operation='publish v1.1.0 draft (PATCH /releases)')
     release = api(f'releases/{release["id"]}')
