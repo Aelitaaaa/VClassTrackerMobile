@@ -1,0 +1,151 @@
+name: Signed Android release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_certificate_sha256:
+        description: SHA-256 certificate fingerprint from the retained signing backup
+        required: true
+        type: string
+      backup_confirmed:
+        description: The encrypted signing backup and its recovery identity are safely retained separately
+        required: true
+        default: false
+        type: boolean
+      signing_key_change_approval:
+        description: If the certificate changed, type APPROVE NEW CERTIFICATE
+        required: false
+        type: string
+      publish:
+        description: Publish v1.1.0 after all signature and backup checks pass
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vclass-release-v1.1.0
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+      actions: read
+    env:
+      EXPECTED_SIGNING_CERTIFICATE: ${{ inputs.expected_certificate_sha256 }}
+      KEY_BACKUP_CONFIRMED: ${{ inputs.backup_confirmed }}
+      SIGNING_KEY_CHANGE_APPROVAL: ${{ inputs.signing_key_change_approval }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check release prerequisites
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          if os.environ['GITHUB_REPOSITORY'] != 'Aelitaaaa/VClassTrackerMobile' or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Run this release workflow on the original repository main branch.')
+          names = ['ANDROID_KEYSTORE_BASE64', 'ANDROID_KEYSTORE_PASSWORD', 'ANDROID_KEY_ALIAS', 'ANDROID_KEY_PASSWORD']
+          missing = [n for n in names if not os.environ.get(n)]
+          if missing:
+              raise SystemExit('Missing repository secrets: ' + ', '.join(missing))
+          fingerprint = os.environ.get('EXPECTED_SIGNING_CERTIFICATE', '').replace(':', '').strip()
+          if not re.fullmatch('[0-9a-fA-F]{64}', fingerprint):
+              raise SystemExit('A signing certificate SHA-256 fingerprint is required.')
+          if os.environ.get('KEY_BACKUP_CONFIRMED') != 'true':
+              raise SystemExit('Retain the signing backup before running this workflow.')
+          baseline = json.loads(Path('scripts/release/v1.0.0-signing.json').read_text())
+          if fingerprint.lower() != baseline['certificate_sha256'] and os.environ.get('SIGNING_KEY_CHANGE_APPROVAL') != 'APPROVE NEW CERTIFICATE':
+              raise SystemExit('A changed certificate requires APPROVE NEW CERTIFICATE before build.')
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+      - name: Install release build tools
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Restore private keystore outside checkout
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          os.umask(0o077)
+          folder = Path(os.environ['RUNNER_TEMP']) / 'vclass-signing'
+          folder.mkdir(mode=0o700)
+          data = base64.b64decode(os.environ['ANDROID_KEYSTORE_BASE64'], validate=True)
+          if not 100 <= len(data) <= 1024 * 1024:
+              raise SystemExit('Invalid keystore size.')
+          path = folder / 'release.keystore'
+          path.write_bytes(data)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'ANDROID_KEYSTORE_PATH={path}\n')
+          PY
+      - name: Build production release
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          bash gradlew --no-daemon --no-configuration-cache --no-build-cache --max-workers=1 -PrequireReleaseSigning=true assembleRelease
+          mkdir -p release
+          cp app/build/outputs/apk/release/app-release.apk release/VClass-Tracker-v1.1.0.apk
+      - name: Verify signature, package, version, approval, and checksum
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, urllib.request
+          from pathlib import Path
+          baseline = json.loads(Path('scripts/release/v1.0.0-signing.json').read_text())
+          path = Path(os.environ['RUNNER_TEMP']) / 'vclass-v1.0.0.apk'
+          with urllib.request.urlopen(baseline['download_url'], timeout=60) as response:
+              data = response.read()
+          if hashlib.sha256(data).hexdigest() != baseline['apk_sha256']:
+              raise SystemExit('The v1.0.0 public APK has changed.')
+          path.write_bytes(data)
+          PY
+          python3 scripts/release/verify_apk.py \
+            --apk release/VClass-Tracker-v1.1.0.apk \
+            --legacy-apk "$RUNNER_TEMP/vclass-v1.0.0.apk" \
+            --tools "$ANDROID_HOME/build-tools/36.0.0" --output release
+      - name: Publish verified release and check public downloads
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/publish_release.py --directory release
+      - name: Retain verified production APK
+        if: ${{ !inputs.publish }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vclass-verified-signed-release
+          retention-days: 7
+          path: |
+            release/VClass-Tracker-v1.1.0.apk
+            release/VClass-Tracker-v1.1.0.apk.sha256
+            release/verification.json
+      - name: Remove signing material
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          shutil.rmtree(Path(os.environ['RUNNER_TEMP']) / 'vclass-signing', ignore_errors=True)
+          PY
