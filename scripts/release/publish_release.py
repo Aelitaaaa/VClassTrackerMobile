@@ -221,6 +221,8 @@ def main():
     release = api(f'releases/{release["id"]}')
     if release['draft'] or release['prerelease'] or tag_commit() != RELEASE_COMMIT:
         raise RuntimeError('Published release or tag verification failed')
+    # Draft asset URLs use an untagged-* slug; publication changes them to TAG.
+    assets = release_assets(release, notes)
     # Download without an authorization header: the final assets must be public.
     for name in (APK, APK + '.sha256'):
         url = assets[name]['browser_download_url']

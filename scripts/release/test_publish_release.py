@@ -41,7 +41,7 @@ class PublisherTests(unittest.TestCase):
     def add_asset(self, name):
         self.uploaded[name] = (self.folder / name).read_bytes()
         self.release['assets'].append({'name': name, 'state': 'uploaded',
-            'browser_download_url': f'https://github.com/{publisher.REPO}/releases/download/{publisher.TAG}/{name}'})
+            'browser_download_url': f'https://github.com/{publisher.REPO}/releases/download/untagged-fixture/{name}'})
 
     def api(self, path, **kwargs):
         if path == '':
@@ -86,6 +86,9 @@ class PublisherTests(unittest.TestCase):
                 self.release['body'] = Path(args[args.index('--notes-file') + 1]).read_text()
             else:
                 self.release['draft'] = False
+                self.release['assets'] = [{**asset, 'browser_download_url':
+                    f'https://github.com/{publisher.REPO}/releases/download/{publisher.TAG}/{asset["name"]}'}
+                    for asset in self.release['assets']]
         else:
             raise AssertionError('Unexpected mutation: ' + repr(args))
         return ''
