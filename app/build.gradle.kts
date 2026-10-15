@@ -15,6 +15,29 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+val signingEnvironment = mapOf(
+    "storeFile" to System.getenv("ANDROID_KEYSTORE_PATH"),
+    "storePassword" to System.getenv("ANDROID_KEYSTORE_PASSWORD"),
+    "keyAlias" to System.getenv("ANDROID_KEY_ALIAS"),
+    "keyPassword" to System.getenv("ANDROID_KEY_PASSWORD")
+)
+if (signingEnvironment.values.any { !it.isNullOrBlank() }) {
+    require(signingEnvironment.values.all { !it.isNullOrBlank() }) {
+        "Incomplete Android release signing environment; configure all four signing values."
+    }
+    signingEnvironment.forEach { (name, value) -> keystoreProperties.setProperty(name, value!!) }
+}
+val hasReleaseSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !keystoreProperties.getProperty(it).isNullOrBlank() }
+if (providers.gradleProperty("requireReleaseSigning").orNull == "true") {
+    require(hasReleaseSigning) { "Release signing is required; signing credentials are missing." }
+}
+if (hasReleaseSigning) {
+    require(rootProject.file(keystoreProperties.getProperty("storeFile")).isFile) {
+        "The configured release keystore file is missing."
+    }
+}
+
 android {
     namespace = "com.dzaky.vclasstracker"
     compileSdk = 36
@@ -23,11 +46,11 @@ android {
         applicationId = "com.dzaky.vclasstracker"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
-    if (keystorePropertiesFile.exists()) {
+    if (hasReleaseSigning) {
         signingConfigs {
             create("release") {
                 storeFile = rootProject.file(
@@ -50,7 +73,7 @@ android {
         release {
             isMinifyEnabled = false
 
-            if (keystorePropertiesFile.exists()) {
+            if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
 
